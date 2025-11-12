@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup
 import logging
 import time
 import argparse
+import re
 from datetime import datetime
 from urllib.parse import urlparse
 import sys
@@ -28,6 +29,29 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+def clean_text_for_search(text):
+    """
+    Очищает текст от специальных символов для более гибкого поиска
+
+    Args:
+        text: Исходный текст
+
+    Returns:
+        str: Очищенный текст
+    """
+    if not text or not isinstance(text, str):
+        return ""
+
+    # Удаляем специальные символы, оставляя только буквы, цифры и пробелы
+    # Убираем знаки препинания, скобки, кавычки и другие спецсимволы
+    cleaned = re.sub(r'[^\w\s]', ' ', text)
+
+    # Заменяем множественные пробелы на один
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+
+    # Убираем пробелы в начале и конце
+    return cleaned.strip()
+
 # Заголовки для имитации браузера
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
@@ -40,20 +64,21 @@ HEADERS = {
 def check_text_on_page(url, text_to_find, timeout=10):
     """
     Проверяет наличие текста на веб-странице
-    
+
     Args:
         url: URL страницы
         text_to_find: Текст для поиска
         timeout: Таймаут запроса в секундах
-    
+
     Returns:
-        tuple: (найден ли текст, сообщение об ошибке если есть)
+        tuple: (найден ли текст, сообщение об ошибке если есть, тип совпадения)
+        тип совпадения: 'exact' - точное совпадение, 'fuzzy' - гибкое совпадение, None - не найдено
     """
     try:
         # Проверка валидности URL
         parsed = urlparse(url)
         if not parsed.scheme or not parsed.netloc:
-            return False, "Invalid URL"
+            return False, "Invalid URL", None
         
         # Выполнение запроса
         response = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
@@ -67,22 +92,49 @@ def check_text_on_page(url, text_to_find, timeout=10):
         
         # Получение текста страницы
         page_text = soup.get_text(separator=' ', strip=True)
-        
-        # Проверка наличия искомого текста
+
+        # Сначала проверяем точное совпадение
         text_found = text_to_find.strip() in page_text
-        
-        return text_found, None
+        match_type = 'exact' if text_found else None
+
+        # Если точное совпадение не найдено, пробуем гибкий поиск
+        if not text_found:
+            cleaned_search_text = clean_text_for_search(text_to_find)
+            cleaned_page_text = clean_text_for_search(page_text)
+
+            # Ищем очищенный текст в очищенной странице
+            if cleaned_search_text and len(cleaned_search_text) > 3:
+                # Сначала пробуем найти полное совпадение очищенного текста
+                text_found = cleaned_search_text in cleaned_page_text
+
+                # Если не найдено полное совпадение, ищем ключевые слова
+                if not text_found and len(cleaned_search_text.split()) >= 2:
+                    # Ищем хотя бы 2 ключевых слова из очищенного текста
+                    search_words = set(cleaned_search_text.split())
+                    page_words = set(cleaned_page_text.split())
+                    common_words = search_words.intersection(page_words)
+
+                    # Если найдено хотя бы 2 общих слова, считаем это fuzzy match
+                    if len(common_words) >= 2:
+                        text_found = True
+                        logger.debug(f"Fuzzy match found via keywords: {common_words} from '{cleaned_search_text}'")
+
+                if text_found:
+                    match_type = 'fuzzy'
+                    logger.debug(f"Fuzzy match found: '{cleaned_search_text}' in cleaned page text")
+
+        return text_found, None, match_type
         
     except requests.exceptions.Timeout:
-        return False, f"Timeout when accessing {url}"
+        return False, f"Timeout when accessing {url}", None
     except requests.exceptions.ConnectionError:
-        return False, f"Connection error to {url}"
+        return False, f"Connection error to {url}", None
     except requests.exceptions.HTTPError as e:
-        return False, f"HTTP error {e.response.status_code} for {url}"
+        return False, f"HTTP error {e.response.status_code} for {url}", None
     except requests.exceptions.RequestException as e:
-        return False, f"Request error: {str(e)}"
+        return False, f"Request error: {str(e)}", None
     except Exception as e:
-        return False, f"Unexpected error: {str(e)}"
+        return False, f"Unexpected error: {str(e)}", None
 
 def process_excel_file(filename, delay=1, sheet_names=None):
     """
@@ -162,13 +214,15 @@ def process_excel_file(filename, delay=1, sheet_names=None):
                 logger.info(f"Link: {link}")
 
                 # Проверка наличия текста на странице
-                found, error = check_text_on_page(link, text)
+                found, error, match_type = check_text_on_page(link, text)
 
                 if error:
                     logger.error(f"Row {idx} (sheet '{sheet_name}'): ERROR - {error}")
                     error_count += 1
                 elif found:
-                    logger.info(f"Row {idx} (sheet '{sheet_name}'): ✓ FOUND - Text present on page")
+                    match_indicator = "✓" if match_type == 'exact' else "≈"
+                    match_desc = "exact match" if match_type == 'exact' else "fuzzy match"
+                    logger.info(f"Row {idx} (sheet '{sheet_name}'): {match_indicator} FOUND ({match_desc}) - Text present on page")
                     found_count += 1
                 else:
                     logger.warning(f"Row {idx} (sheet '{sheet_name}'): ✗ NOT FOUND - Text absent from page")
