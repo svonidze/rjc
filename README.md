@@ -44,17 +44,26 @@ python check_links.py <путь_к_файлу.xlsx>
 
 Примеры:
 ```bash
-# Основной запуск
-python check_links.py data.xlsx
+# Основной запуск (только первый лист по умолчанию)
+python check_links.py Antisemitizm_v_Runete_29_09_2025_12_10_2025_68ee12385c4b17276166d275.xlsx
+
+# Обработка всех листов
+python check_links.py Antisemitizm_v_Runete_29_09_2025_12_10_2025_68ee12385c4b17276166d275.xlsx --all-sheets
+
+# Обработка конкретных листов по индексам (начиная с 0)
+python check_links.py Antisemitizm_v_Runete_29_09_2025_12_10_2025_68ee12385c4b17276166d275.xlsx --sheets 0 1
+
+# Обработка конкретных листов по именам
+python check_links.py Antisemitizm_v_Runete_29_09_2025_12_10_2025_68ee12385c4b17276166d275.xlsx --sheets "Лист1" "Результаты"
 
 # С увеличенной задержкой между запросами (2 секунды)
-python check_links.py data.xlsx --delay 2
+python check_links.py Antisemitizm_v_Runete_29_09_2025_12_10_2025_68ee12385c4b17276166d275.xlsx --delay 2
 
 # С кастомным таймаутом (15 секунд)
-python check_links.py data.xlsx --timeout 15
+python check_links.py Antisemitizm_v_Runete_29_09_2025_12_10_2025_68ee12385c4b17276166d275.xlsx --timeout 15
 
 # Комбинация параметров
-python check_links.py data.xlsx --delay 0.5 --timeout 20
+python check_links.py Antisemitizm_v_Runete_29_09_2025_12_10_2025_68ee12385c4b17276166d275.xlsx --all-sheets --delay 0.5 --timeout 20
 ```
 
 ### Аргументы командной строки
@@ -62,7 +71,32 @@ python check_links.py data.xlsx --delay 0.5 --timeout 20
 - **`excel_file`** (обязательный) - Путь к Excel файлу для обработки
 - **`-d, --delay`** (опциональный) - Задержка между запросами в секундах (по умолчанию: 1.0)
 - **`-t, --timeout`** (опциональный) - Таймаут для HTTP запросов в секундах (по умолчанию: 10)
+- **`--all-sheets`** - Обработать все листы в Excel файле
+- **`--sheets SHEET [SHEET ...]`** - Указать конкретные листы по именам или индексам (по умолчанию: только первый лист)
 - **`-h, --help`** - Показать справку
+
+### Работа с листами Excel
+
+По умолчанию скрипт обрабатывает только первый лист Excel файла. Вы можете изменить это поведение:
+
+- **Один лист** (по умолчанию): Обрабатывается только первый лист
+- **Все листы**: Используйте `--all-sheets` для обработки всех листов
+- **Конкретные листы**: Используйте `--sheets` с указанием имен или индексов листов
+
+**Примеры:**
+```bash
+# Только первый лист (по умолчанию)
+python check_links.py data.xlsx
+
+# Все листы
+python check_links.py data.xlsx --all-sheets
+
+# Конкретные листы по индексам (начиная с 0)
+python check_links.py data.xlsx --sheets 0 2 4
+
+# Конкретные листы по именам
+python check_links.py data.xlsx --sheets "Лист1" "Результаты"
+```
 
 ### Формат входных данных
 
