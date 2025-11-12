@@ -44,8 +44,11 @@ python check_links.py <путь_к_файлу.xlsx>
 
 Примеры:
 ```bash
-# Основной запуск (CSV: example_found_matches.csv)
+# Основной запуск (CSV: example_found_matches.csv, логи: logs/)
 python check_links.py example.xlsx
+
+# Кастомная папка для логов
+python check_links.py example.xlsx --log-dir my_logs
 
 # Обработка всех листов
 python check_links.py example.xlsx --all-sheets
@@ -67,6 +70,9 @@ python check_links.py example.xlsx --output-csv found_matches.csv
 
 # Комбинация параметров с автоматическим CSV
 python check_links.py example.xlsx --all-sheets --delay 0.5 --timeout 20
+
+# Полный пример с кастомными путями
+python check_links.py example.xlsx --log-dir ./run_logs --output-csv results.csv --all-sheets
 ```
 
 ### Аргументы командной строки
@@ -77,6 +83,7 @@ python check_links.py example.xlsx --all-sheets --delay 0.5 --timeout 20
 - **`--all-sheets`** - Обработать все листы в Excel файле
 - **`--sheets SHEET [SHEET ...]`** - Указать конкретные листы по именам или индексам (по умолчанию: только первый лист)
 - **`-o, --output-csv [FILE]`** - Сохранить найденные совпадения в CSV файл (автоматически генерируется если не указано)
+- **`-l, --log-dir DIR`** - Папка для сохранения лог-файлов (по умолчанию: logs/)
 - **`-h, --help`** - Показать справку
 
 ### Работа с листами Excel

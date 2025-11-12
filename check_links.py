@@ -17,18 +17,47 @@ from urllib.parse import urlparse
 import sys
 import os
 
-# Настройка логирования
-log_filename = f'check_results_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_filename, encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
-
+# Глобальный логгер (будет настроен позже в main)
 logger = logging.getLogger(__name__)
+
+def setup_logging(log_dir=None):
+    """
+    Настраивает логирование с указанным путем к логам
+
+    Args:
+        log_dir: Путь к папке для логов (None - использовать 'logs')
+    """
+    global log_filename
+
+    # Определяем папку для логов
+    if log_dir is None:
+        log_dir = 'logs'
+    else:
+        log_dir = log_dir.strip()
+
+    # Создаем папку, если она не существует
+    created_dir = False
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+        created_dir = True
+
+    # Генерируем имя лог-файла
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = os.path.join(log_dir, f'check_results_{timestamp}.log')
+
+    # Настраиваем логирование
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_filename, encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+
+    # Теперь можем использовать logger
+    if created_dir:
+        logger.info(f"Created logs directory: {log_dir}")
 
 def clean_text_for_search(text):
     """
@@ -338,12 +367,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python check_links.py data.xlsx  # Process first sheet, auto CSV: data_found_matches.csv
+  python check_links.py data.xlsx  # Default logs in logs/ directory
+  python check_links.py data.xlsx --log-dir my_logs  # Custom log directory
   python check_links.py data.xlsx --all-sheets  # Process all sheets
   python check_links.py data.xlsx --sheets 0 2  # Process sheets by index
-  python check_links.py data.xlsx --sheets "Sheet1" "Sheet3"  # Process sheets by name
   python check_links.py data.xlsx --output-csv results.csv  # Custom CSV filename
-  python check_links.py data.xlsx --delay 2 --timeout 15  # Auto CSV with custom settings
+  python check_links.py data.xlsx --delay 2 --timeout 15 --log-dir ./run_logs  # Full example
         """
     )
     
@@ -375,6 +404,12 @@ Examples:
         help='Output CSV file to save found matches (auto-generated if not specified)'
     )
 
+    parser.add_argument(
+        '-l', '--log-dir',
+        type=str,
+        help='Directory for log files (default: logs/)'
+    )
+
     sheet_group = parser.add_mutually_exclusive_group()
 
     sheet_group.add_argument(
@@ -397,6 +432,9 @@ Examples:
     if not os.path.exists(args.excel_file):
         print(f"Error: File '{args.excel_file}' not found!")
         sys.exit(1)
+
+    # Настраиваем логирование
+    setup_logging(args.log_dir)
 
     # Автоматическая генерация имени CSV файла, если не указано
     csv_output = args.output_csv
@@ -433,7 +471,8 @@ Examples:
     print("="*80)
     print(f"Excel file: {args.excel_file}")
     print(f"Sheets to process: {sheets_info}")
-    print(f"Log file: {log_filename}")
+    print(f"Log directory: {os.path.dirname(log_filename)}")
+    print(f"Log file: {os.path.basename(log_filename)}")
     print(f"CSV output: {csv_output}")
     print(f"Delay between requests: {args.delay} sec")
     print(f"Request timeout: {args.timeout} sec")
