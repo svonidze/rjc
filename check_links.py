@@ -9,8 +9,11 @@ import requests
 from bs4 import BeautifulSoup
 import logging
 import time
+import argparse
 from datetime import datetime
 from urllib.parse import urlparse
+import sys
+import os
 
 # Настройка логирования
 log_filename = f'check_results_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
@@ -167,18 +170,58 @@ def process_excel_file(filename, delay=1):
 
 def main():
     """Главная функция"""
-    excel_file = "Antisemitizm_v_Runete_29_09_2025_12_10_2025_68ee12385c4b17276166d275.xlsx"
+    # Настройка парсера аргументов командной строки
+    parser = argparse.ArgumentParser(
+        description='Check text from column G on web pages using links from column I',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python check_links.py data.xlsx
+  python check_links.py data.xlsx --delay 2
+  python check_links.py data.xlsx --delay 0.5 --timeout 15
+        """
+    )
+    
+    parser.add_argument(
+        'excel_file',
+        type=str,
+        help='Path to Excel file to process'
+    )
+    
+    parser.add_argument(
+        '-d', '--delay',
+        type=float,
+        default=1.0,
+        help='Delay between requests in seconds (default: 1.0)'
+    )
+    
+    parser.add_argument(
+        '-t', '--timeout',
+        type=int,
+        default=10,
+        help='Timeout for HTTP requests in seconds (default: 10)'
+    )
+    
+    # Парсинг аргументов
+    args = parser.parse_args()
+    
+    # Проверка существования файла
+    if not os.path.exists(args.excel_file):
+        print(f"Ошибка: Файл '{args.excel_file}' не найден!")
+        sys.exit(1)
     
     print("="*80)
     print("Скрипт проверки наличия текста на веб-страницах")
     print("="*80)
-    print(f"Excel файл: {excel_file}")
+    print(f"Excel файл: {args.excel_file}")
     print(f"Файл лога: {log_filename}")
+    print(f"Задержка между запросами: {args.delay} сек")
+    print(f"Таймаут запросов: {args.timeout} сек")
     print("="*80)
     print()
     
     # Запуск обработки
-    process_excel_file(excel_file, delay=1)
+    process_excel_file(args.excel_file, delay=args.delay)
     
     print()
     print("="*80)

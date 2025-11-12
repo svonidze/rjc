@@ -37,20 +37,44 @@ pip install pandas openpyxl requests beautifulsoup4 lxml
 
 ### Запуск скрипта
 
+Базовый запуск:
 ```bash
-python check_links.py
+python check_links.py <путь_к_файлу.xlsx>
 ```
+
+Примеры:
+```bash
+# Основной запуск
+python check_links.py data.xlsx
+
+# С увеличенной задержкой между запросами (2 секунды)
+python check_links.py data.xlsx --delay 2
+
+# С кастомным таймаутом (15 секунд)
+python check_links.py data.xlsx --timeout 15
+
+# Комбинация параметров
+python check_links.py data.xlsx --delay 0.5 --timeout 20
+```
+
+### Аргументы командной строки
+
+- **`excel_file`** (обязательный) - Путь к Excel файлу для обработки
+- **`-d, --delay`** (опциональный) - Задержка между запросами в секундах (по умолчанию: 1.0)
+- **`-t, --timeout`** (опциональный) - Таймаут для HTTP запросов в секундах (по умолчанию: 10)
+- **`-h, --help`** - Показать справку
 
 ### Формат входных данных
 
-Скрипт ожидает Excel файл с именем:
-```
-Antisemitizm_v_Runete_29_09_2025_12_10_2025_68ee12385c4b17276166d275.xlsx
-```
-
-Структура файла:
+Структура Excel файла:
 - **Столбец G**: Текстовые строки для поиска
 - **Столбец I**: Ссылки на веб-страницы
+
+### Просмотр справки
+
+```bash
+python check_links.py --help
+```
 
 ### Выходные данные
 
