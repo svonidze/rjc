@@ -45,25 +45,25 @@ python check_links.py <путь_к_файлу.xlsx>
 Примеры:
 ```bash
 # Основной запуск (только первый лист по умолчанию)
-python check_links.py Antisemitizm_v_Runete_29_09_2025_12_10_2025_68ee12385c4b17276166d275.xlsx
+python check_links.py example.xlsx
 
 # Обработка всех листов
-python check_links.py Antisemitizm_v_Runete_29_09_2025_12_10_2025_68ee12385c4b17276166d275.xlsx --all-sheets
+python check_links.py example.xlsx --all-sheets
 
 # Обработка конкретных листов по индексам (начиная с 0)
-python check_links.py Antisemitizm_v_Runete_29_09_2025_12_10_2025_68ee12385c4b17276166d275.xlsx --sheets 0 1
+python check_links.py example.xlsx --sheets 0 1
 
 # Обработка конкретных листов по именам
-python check_links.py Antisemitizm_v_Runete_29_09_2025_12_10_2025_68ee12385c4b17276166d275.xlsx --sheets "Лист1" "Результаты"
+python check_links.py example.xlsx --sheets "Лист1" "Результаты"
 
 # С увеличенной задержкой между запросами (2 секунды)
-python check_links.py Antisemitizm_v_Runete_29_09_2025_12_10_2025_68ee12385c4b17276166d275.xlsx --delay 2
+python check_links.py example.xlsx --delay 2
 
 # С кастомным таймаутом (15 секунд)
-python check_links.py Antisemitizm_v_Runete_29_09_2025_12_10_2025_68ee12385c4b17276166d275.xlsx --timeout 15
+python check_links.py example.xlsx --timeout 15
 
 # Комбинация параметров
-python check_links.py Antisemitizm_v_Runete_29_09_2025_12_10_2025_68ee12385c4b17276166d275.xlsx --all-sheets --delay 0.5 --timeout 20
+python check_links.py example.xlsx --all-sheets --delay 0.5 --timeout 20
 ```
 
 ### Аргументы командной строки
