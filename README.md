@@ -44,7 +44,7 @@ python check_links.py <путь_к_файлу.xlsx>
 
 Примеры:
 ```bash
-# Основной запуск (только первый лист по умолчанию)
+# Основной запуск (CSV: example_found_matches.csv)
 python check_links.py example.xlsx
 
 # Обработка всех листов
@@ -62,7 +62,10 @@ python check_links.py example.xlsx --delay 2
 # С кастомным таймаутом (15 секунд)
 python check_links.py example.xlsx --timeout 15
 
-# Комбинация параметров
+# Сохранение найденных совпадений в CSV
+python check_links.py example.xlsx --output-csv found_matches.csv
+
+# Комбинация параметров с автоматическим CSV
 python check_links.py example.xlsx --all-sheets --delay 0.5 --timeout 20
 ```
 
@@ -73,6 +76,7 @@ python check_links.py example.xlsx --all-sheets --delay 0.5 --timeout 20
 - **`-t, --timeout`** (опциональный) - Таймаут для HTTP запросов в секундах (по умолчанию: 10)
 - **`--all-sheets`** - Обработать все листы в Excel файле
 - **`--sheets SHEET [SHEET ...]`** - Указать конкретные листы по именам или индексам (по умолчанию: только первый лист)
+- **`-o, --output-csv [FILE]`** - Сохранить найденные совпадения в CSV файл (автоматически генерируется если не указано)
 - **`-h, --help`** - Показать справку
 
 ### Работа с листами Excel
@@ -143,6 +147,24 @@ check_results_YYYYMMDD_HHMMSS.log
 - Текст для поиска
 - Ссылка
 - Результат проверки (найдено/не найдено/ошибка)
+
+### CSV вывод найденных совпадений
+
+Если указан параметр `--output-csv`, скрипт сохранит все найденные совпадения в CSV файл с двумя колонками:
+
+- **URL**: Ссылка на веб-страницу
+- **Found Text**: Найденный текст (может содержать несколько строк)
+
+CSV файл использует правильное экранирование для многострочного текста. Пример содержимого:
+
+```csv
+URL,Found Text
+"https://example.com/page1","This is found text with
+multiple lines and special characters"
+"https://example.com/page2","Simple text"
+```
+
+Файл сохраняется с кодировкой UTF-8 с BOM для корректного отображения в Excel.
 
 ## Примеры вывода
 

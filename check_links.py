@@ -11,6 +11,7 @@ import logging
 import time
 import argparse
 import re
+import csv
 from datetime import datetime
 from urllib.parse import urlparse
 import sys
@@ -52,6 +53,28 @@ def clean_text_for_search(text):
     # Убираем пробелы в начале и конце
     return cleaned.strip()
 
+def save_found_matches_to_csv(matches, csv_filename):
+    """
+    Сохраняет найденные совпадения в CSV файл
+
+    Args:
+        matches: Список кортежей (url, text)
+        csv_filename: Имя CSV файла для сохранения
+    """
+    try:
+        with open(csv_filename, 'w', newline='', encoding='utf-8-sig') as csvfile:
+            writer = csv.writer(csvfile, quoting=csv.QUOTE_ALL, escapechar='\\')
+            # Записываем заголовки
+            writer.writerow(['URL', 'Found Text'])
+            # Записываем данные
+            for url, text in matches:
+                writer.writerow([url, text])
+        logger.info(f"Found matches saved to CSV file: {csv_filename}")
+        return True
+    except Exception as e:
+        logger.error(f"Error saving matches to CSV: {e}")
+        return False
+
 # Заголовки для имитации браузера
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
@@ -75,17 +98,48 @@ def check_text_on_page(url, text_to_find, timeout=10):
         тип совпадения: 'exact' - точное совпадение, 'fuzzy' - гибкое совпадение, None - не найдено
     """
     try:
-        # Проверка валидности URL
+        # Проверка валидности URL или локального пути
         parsed = urlparse(url)
-        if not parsed.scheme or not parsed.netloc:
-            return False, "Invalid URL", None
+        is_local_file = False
+
+        if parsed.scheme in ('http', 'https'):
+            # Web URL
+            response = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+            response.raise_for_status()
+        elif parsed.scheme == 'file' or os.path.exists(url):
+            # Локальный файл
+            is_local_file = True
+            if parsed.scheme == 'file':
+                file_path = parsed.path
+                # Убираем ведущий слэш для Windows путей
+                if file_path.startswith('/') and os.name == 'nt':
+                    file_path = file_path[1:]
+            else:
+                # Для Windows путей вида C:/path, urlparse неправильно разбирает scheme
+                # Используем оригинальный URL как путь к файлу
+                file_path = url
+
+            if not os.path.exists(file_path):
+                return False, f"Local file not found: {file_path}", None
+
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            # Создаем объект, имитирующий requests response
+            class MockResponse:
+                def __init__(self, text):
+                    self.text = text
+                    self.status_code = 200
+
+                def raise_for_status(self):
+                    pass
+
+            response = MockResponse(content)
+        else:
+            return False, "Invalid URL or file path", None
         
-        # Выполнение запроса
-        response = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
-        response.raise_for_status()
-        
-        # Определение кодировки
-        response.encoding = response.apparent_encoding
+        # Определение кодировки (только для веб-запросов)
+        if not is_local_file:
+            response.encoding = response.apparent_encoding
         
         # Парсинг HTML
         soup = BeautifulSoup(response.text, 'html.parser')
@@ -136,7 +190,7 @@ def check_text_on_page(url, text_to_find, timeout=10):
     except Exception as e:
         return False, f"Unexpected error: {str(e)}", None
 
-def process_excel_file(filename, delay=1, sheet_names=None):
+def process_excel_file(filename, delay=1, sheet_names=None, csv_output=None):
     """
     Обрабатывает Excel файл и проверяет ссылки
 
@@ -144,6 +198,7 @@ def process_excel_file(filename, delay=1, sheet_names=None):
         filename: Путь к Excel файлу
         delay: Задержка между запросами в секундах
         sheet_names: Имена или индексы листов для обработки (None - все листы)
+        csv_output: Путь к CSV файлу для сохранения найденных совпадений (None - не сохранять)
     """
     logger.info(f"Starting processing file: {filename}")
 
@@ -170,6 +225,7 @@ def process_excel_file(filename, delay=1, sheet_names=None):
         found_count_all = 0
         not_found_count_all = 0
         error_count_all = 0
+        found_matches = []  # Список найденных совпадений для CSV
 
         # Обработка каждого листа
         for sheet_name, df in sheets_dict.items():
@@ -223,6 +279,10 @@ def process_excel_file(filename, delay=1, sheet_names=None):
                     match_indicator = "✓" if match_type == 'exact' else "≈"
                     match_desc = "exact match" if match_type == 'exact' else "fuzzy match"
                     logger.info(f"Row {idx} (sheet '{sheet_name}'): {match_indicator} FOUND ({match_desc}) - Text present on page")
+
+                    # Добавляем найденное совпадение в список для CSV
+                    found_matches.append((link, text))
+
                     found_count += 1
                 else:
                     logger.warning(f"Row {idx} (sheet '{sheet_name}'): ✗ NOT FOUND - Text absent from page")
@@ -246,6 +306,13 @@ def process_excel_file(filename, delay=1, sheet_names=None):
             not_found_count_all += not_found_count
             error_count_all += error_count
 
+        # Сохраняем найденные совпадения в CSV, если указан файл вывода
+        if csv_output and found_matches:
+            if save_found_matches_to_csv(found_matches, csv_output):
+                logger.info(f"Found {len(found_matches)} matches saved to CSV: {csv_output}")
+            else:
+                logger.error("Failed to save matches to CSV file")
+
         # Итоговая статистика по всем листам
         logger.info(f"\n{'='*80}")
         logger.info("FINAL STATISTICS FOR ALL SHEETS:")
@@ -254,6 +321,8 @@ def process_excel_file(filename, delay=1, sheet_names=None):
         logger.info(f"Text not found: {not_found_count_all}")
         logger.info(f"Processing errors: {error_count_all}")
         logger.info(f"Results saved to file: {log_filename}")
+        if csv_output and found_matches:
+            logger.info(f"Found matches saved to CSV: {csv_output}")
 
     except FileNotFoundError:
         logger.error(f"File {filename} not found")
@@ -269,11 +338,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python check_links.py data.xlsx  # Process first sheet only
+  python check_links.py data.xlsx  # Process first sheet, auto CSV: data_found_matches.csv
   python check_links.py data.xlsx --all-sheets  # Process all sheets
   python check_links.py data.xlsx --sheets 0 2  # Process sheets by index
   python check_links.py data.xlsx --sheets "Sheet1" "Sheet3"  # Process sheets by name
-  python check_links.py data.xlsx --delay 2 --timeout 15  # With custom settings
+  python check_links.py data.xlsx --output-csv results.csv  # Custom CSV filename
+  python check_links.py data.xlsx --delay 2 --timeout 15  # Auto CSV with custom settings
         """
     )
     
@@ -295,6 +365,14 @@ Examples:
         type=int,
         default=10,
         help='Timeout for HTTP requests in seconds (default: 10)'
+    )
+
+    parser.add_argument(
+        '-o', '--output-csv',
+        type=str,
+        nargs='?',
+        const=None,
+        help='Output CSV file to save found matches (auto-generated if not specified)'
     )
 
     sheet_group = parser.add_mutually_exclusive_group()
@@ -319,6 +397,13 @@ Examples:
     if not os.path.exists(args.excel_file):
         print(f"Error: File '{args.excel_file}' not found!")
         sys.exit(1)
+
+    # Автоматическая генерация имени CSV файла, если не указано
+    csv_output = args.output_csv
+    if csv_output is None:
+        # Получаем имя файла без расширения и добавляем суффикс
+        base_name = os.path.splitext(args.excel_file)[0]
+        csv_output = f"{base_name}_found_matches.csv"
 
     # Определение листов для обработки
     sheet_names = 0  # По умолчанию первый лист (индекс 0)
@@ -349,13 +434,14 @@ Examples:
     print(f"Excel file: {args.excel_file}")
     print(f"Sheets to process: {sheets_info}")
     print(f"Log file: {log_filename}")
+    print(f"CSV output: {csv_output}")
     print(f"Delay between requests: {args.delay} sec")
     print(f"Request timeout: {args.timeout} sec")
     print("="*80)
     print()
 
     # Запуск обработки
-    process_excel_file(args.excel_file, delay=args.delay, sheet_names=sheet_names)
+    process_excel_file(args.excel_file, delay=args.delay, sheet_names=sheet_names, csv_output=csv_output)
 
     print()
     print("="*80)
