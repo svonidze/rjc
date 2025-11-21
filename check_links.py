@@ -24,20 +24,25 @@ import os
 # Минимальная длина очищенного текста для применения fuzzy поиска (в символах)
 MIN_FUZZY_TEXT_LENGTH = 3
 
-# Минимальный процент совпадающих слов для keyword match (0.0 - 1.0)
-# Формула: (количество общих слов / количество слов в поисковом тексте) >= MIN_MATCH_RATIO
+# Минимальный процент найденных слов в правильном порядке для fuzzy match (0.0 - 1.0)
+# Формула: (количество найденных слов в порядке / количество слов в поисковом тексте) >= MIN_MATCH_RATIO
 # 
-# Примеры:
-#   0.3 (30%) - мягкий поиск, подходит для длинных текстов
-#   0.5 (50%) - сбалансированный поиск (рекомендуется)
-#   0.7 (70%) - строгий поиск, меньше ложных срабатываний
+# ВАЖНО: Fuzzy match ищет слова В ТОМ ЖЕ ПОРЯДКЕ, игнорируя спецсимволы и лишние слова между ними
 #
-# Дополнительно: всегда требуется минимум MIN_COMMON_WORDS_ABSOLUTE общих слов
-MIN_MATCH_RATIO = 0.5
+# Примеры:
+#   0.7 (70%) - строгий поиск (рекомендуется)
+#   0.8 (80%) - очень строгий поиск
+#   0.9 (90%) - почти все слова должны быть найдены в порядке
+MIN_MATCH_RATIO = 0.7
 
-# Абсолютный минимум общих слов (защита от ложных срабатываний на коротких текстах)
-# Даже если процент высокий, должно быть минимум столько общих слов
-MIN_COMMON_WORDS_ABSOLUTE = 2
+# Абсолютный минимум найденных слов в порядке (защита от ложных срабатываний)
+# Даже если процент высокий, должно быть минимум столько слов в правильном порядке
+MIN_WORDS_IN_SEQUENCE = 3
+
+# Максимальное количество "лишних" слов между искомыми словами
+# Например, если ищем "слово1 слово2", а на странице "слово1 лишнее1 лишнее2 слово2"
+# то между ними 2 лишних слова
+MAX_WORDS_BETWEEN = 1
 
 # Количество слов контекста вокруг найденного текста для логирования
 CONTEXT_WORDS_BEFORE = 20  # Слов до найденного текста
@@ -301,33 +306,63 @@ def check_text_on_page(url, text_to_find, timeout=10):
                             'after': after
                         }
 
-                # Если не найдено полное совпадение, ищем ключевые слова
+                # Если не найдено полное совпадение, ищем слова в правильном порядке
                 if not text_found and len(cleaned_search_text.split()) >= 2:
-                    # Ищем общие слова между поисковым текстом и страницей
-                    search_words = set(cleaned_search_text.split())
-                    page_words = set(cleaned_page_text.split())
-                    common_words = search_words.intersection(page_words)
+                    # Разбиваем поисковый текст и текст страницы на слова
+                    search_words_list = cleaned_search_text.split()
+                    page_words_list = cleaned_page_text.split()
                     
-                    # Вычисляем процент совпадения
-                    match_ratio = len(common_words) / len(search_words) if len(search_words) > 0 else 0
+                    # Ищем максимальную последовательность слов в правильном порядке
+                    # Используем алгоритм поиска подпоследовательности с ограничением на пропуски
+                    found_sequence = []
+                    search_idx = 0
+                    page_idx = 0
+                    sequence_start_pos = -1
+                    sequence_end_pos = -1
+                    words_skipped = 0
                     
-                    # Проверяем оба условия: процент И абсолютный минимум
+                    while search_idx < len(search_words_list) and page_idx < len(page_words_list):
+                        if search_words_list[search_idx] == page_words_list[page_idx]:
+                            # Нашли слово в правильном порядке
+                            if sequence_start_pos == -1:
+                                sequence_start_pos = page_idx
+                            found_sequence.append(search_words_list[search_idx])
+                            sequence_end_pos = page_idx
+                            search_idx += 1
+                            page_idx += 1
+                            words_skipped = 0  # Сбрасываем счетчик пропусков
+                        else:
+                            # Слово не совпало, пропускаем слово на странице
+                            page_idx += 1
+                            words_skipped += 1
+                            
+                            # Если пропустили слишком много слов, начинаем заново
+                            if words_skipped > MAX_WORDS_BETWEEN:
+                                search_idx = 0
+                                found_sequence = []
+                                sequence_start_pos = -1
+                                words_skipped = 0
+                    
+                    # Вычисляем процент найденных слов в порядке
+                    match_ratio = len(found_sequence) / len(search_words_list) if len(search_words_list) > 0 else 0
+                    
+                    # Проверяем условия: процент И абсолютный минимум слов в последовательности
                     if (match_ratio >= MIN_MATCH_RATIO and 
-                        len(common_words) >= MIN_COMMON_WORDS_ABSOLUTE):
+                        len(found_sequence) >= MIN_WORDS_IN_SEQUENCE):
                         text_found = True
-                        logger.debug(f"Fuzzy match found via keywords: {common_words} from '{cleaned_search_text}' "
-                                   f"(match ratio: {match_ratio:.2%}, {len(common_words)}/{len(search_words)} words)")
                         
-                        # Для keyword match находим первое общее слово и показываем контекст вокруг него
-                        first_common_word = list(common_words)[0]
-                        word_position = cleaned_page_text.find(first_common_word)
+                        missing_words = [w for w in search_words_list if w not in found_sequence]
                         
-                        if word_position != -1:
+                        logger.debug(f"Fuzzy match found via sequence: {found_sequence} from '{cleaned_search_text}' "
+                                   f"(match ratio: {match_ratio:.2%}, {len(found_sequence)}/{len(search_words_list)} words in order)")
+                        
+                        if sequence_start_pos != -1:
                             # Находим позицию в оригинальном тексте
-                            words_before_match = len(cleaned_page_text[:word_position].split())
+                            words_before_match = sequence_start_pos
                             original_words = page_text.split()
                             
                             if words_before_match < len(original_words):
+                                # Находим позицию начала последовательности в оригинальном тексте
                                 word_count = 0
                                 original_position = 0
                                 for i, char in enumerate(page_text):
@@ -337,13 +372,22 @@ def check_text_on_page(url, text_to_find, timeout=10):
                                             original_position = i
                                             break
                                 
-                                match_length = len(first_common_word) * 2
+                                # Вычисляем длину найденной последовательности
+                                sequence_length = sequence_end_pos - sequence_start_pos + 1
+                                match_length = sum(len(original_words[i]) for i in range(
+                                    words_before_match, 
+                                    min(words_before_match + sequence_length, len(original_words))
+                                )) + sequence_length * 5  # Добавляем примерную длину пробелов
+                                
                                 before, found, after = extract_context(page_text, original_position, match_length)
+                                
                                 context = {
                                     'before': before,
                                     'found': found,
                                     'after': after,
-                                    'common_words': list(common_words)
+                                    'found_words': found_sequence,
+                                    'missing_words': missing_words if missing_words else None,
+                                    'match_ratio': f"{match_ratio:.0%}"
                                 }
 
                 if text_found:
@@ -461,8 +505,12 @@ def process_excel_file(filename, delay=1, sheet_names=None, csv_output=None):
                         logger.info(f"    Found:  [{context.get('found', '')}]")
                         if context.get('after'):
                             logger.info(f"    After:  {context['after'][:200]}...")
-                        if 'common_words' in context:
-                            logger.info(f"    Common words: {', '.join(context['common_words'])}")
+                        if 'found_words' in context:
+                            logger.info(f"    Found words (in order): {', '.join(context['found_words'])}")
+                        if 'missing_words' in context and context['missing_words']:
+                            logger.info(f"    Missing words: {', '.join(context['missing_words'])}")
+                        if 'match_ratio' in context:
+                            logger.info(f"    Match ratio: {context['match_ratio']}")
 
                     # Добавляем найденное совпадение в список для CSV
                     found_matches.append((link, text))
@@ -560,8 +608,12 @@ def check_single_url(url, text, csv_output=None):
             print(f"  Found:  [{context.get('found', '')}]")
             if context.get('after'):
                 print(f"  After:  {context['after'][:200]}...")
-            if 'common_words' in context:
-                print(f"  Common words: {', '.join(context['common_words'])}")
+            if 'found_words' in context:
+                print(f"  Found words (in order): {', '.join(context['found_words'])}")
+            if 'missing_words' in context and context['missing_words']:
+                print(f"  Missing words: {', '.join(context['missing_words'])}")
+            if 'match_ratio' in context:
+                print(f"  Match ratio: {context['match_ratio']}")
         
         # Сохраняем в CSV если указано
         if csv_output:
