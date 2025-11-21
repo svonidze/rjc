@@ -223,7 +223,7 @@ def check_text_on_page(url, text_to_find, timeout=10):
                 file_path = url
 
             if not os.path.exists(file_path):
-                return False, f"Local file not found: {file_path}", None
+                return False, f"Local file not found: {file_path}", None, None
 
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -238,7 +238,7 @@ def check_text_on_page(url, text_to_find, timeout=10):
 
             response = MockResponse(content)
         else:
-            return False, "Invalid URL or file path", None
+            return False, "Invalid URL or file path", None, None
         
         # Определение кодировки (только для веб-запросов)
         if not is_local_file:
