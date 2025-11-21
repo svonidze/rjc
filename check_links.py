@@ -17,6 +17,36 @@ from urllib.parse import urlparse
 import sys
 import os
 
+# ============================================================================
+# КОНСТАНТЫ ДЛЯ НАСТРОЙКИ FUZZY MATCH
+# ============================================================================
+
+# Минимальная длина очищенного текста для применения fuzzy поиска (в символах)
+MIN_FUZZY_TEXT_LENGTH = 3
+
+# Минимальный процент совпадающих слов для keyword match (0.0 - 1.0)
+# Формула: (количество общих слов / количество слов в поисковом тексте) >= MIN_MATCH_RATIO
+# 
+# Примеры:
+#   0.3 (30%) - мягкий поиск, подходит для длинных текстов
+#   0.5 (50%) - сбалансированный поиск (рекомендуется)
+#   0.7 (70%) - строгий поиск, меньше ложных срабатываний
+#
+# Дополнительно: всегда требуется минимум MIN_COMMON_WORDS_ABSOLUTE общих слов
+MIN_MATCH_RATIO = 0.5
+
+# Абсолютный минимум общих слов (защита от ложных срабатываний на коротких текстах)
+# Даже если процент высокий, должно быть минимум столько общих слов
+MIN_COMMON_WORDS_ABSOLUTE = 2
+
+# Количество слов контекста вокруг найденного текста для логирования
+CONTEXT_WORDS_BEFORE = 20  # Слов до найденного текста
+CONTEXT_WORDS_AFTER = 20   # Слов после найденного текста
+
+# ============================================================================
+# НАСТРОЙКИ HTTP ЗАПРОСОВ
+# ============================================================================
+
 # Глобальный логгер (будет настроен позже в main)
 logger = logging.getLogger(__name__)
 
@@ -104,7 +134,7 @@ def save_found_matches_to_csv(matches, csv_filename):
         logger.error(f"Error saving matches to CSV: {e}")
         return False
 
-# Заголовки для имитации браузера
+# HTTP заголовки для имитации браузера
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -112,6 +142,44 @@ HEADERS = {
     'Accept-Encoding': 'gzip, deflate',
     'Connection': 'keep-alive',
 }
+
+def extract_context(text, position, match_length, words_before=CONTEXT_WORDS_BEFORE, words_after=CONTEXT_WORDS_AFTER):
+    """
+    Извлекает контекст вокруг найденного текста
+
+    Args:
+        text: Полный текст
+        position: Позиция начала найденного текста
+        match_length: Длина найденного текста
+        words_before: Количество слов до найденного текста
+        words_after: Количество слов после найденного текста
+
+    Returns:
+        tuple: (before_text, found_text, after_text)
+    """
+    # Извлекаем найденный текст
+    found_text = text[position:position + match_length]
+    
+    # Находим начало контекста (words_before слов назад)
+    start = position
+    words_count = 0
+    while start > 0 and words_count < words_before:
+        start -= 1
+        if start > 0 and text[start].isspace() and not text[start-1].isspace():
+            words_count += 1
+    
+    # Находим конец контекста (words_after слов вперед)
+    end = position + match_length
+    words_count = 0
+    while end < len(text) and words_count < words_after:
+        if end < len(text) - 1 and text[end].isspace() and not text[end+1].isspace():
+            words_count += 1
+        end += 1
+    
+    before = text[start:position].strip()
+    after = text[position + match_length:end].strip()
+    
+    return before, found_text.strip(), after
 
 def check_text_on_page(url, text_to_find, timeout=10):
     """
@@ -123,8 +191,9 @@ def check_text_on_page(url, text_to_find, timeout=10):
         timeout: Таймаут запроса в секундах
 
     Returns:
-        tuple: (найден ли текст, сообщение об ошибке если есть, тип совпадения)
+        tuple: (найден ли текст, сообщение об ошибке если есть, тип совпадения, контекст)
         тип совпадения: 'exact' - точное совпадение, 'fuzzy' - гибкое совпадение, None - не найдено
+        контекст: dict с ключами 'before', 'found', 'after' или None
     """
     try:
         # Проверка валидности URL или локального пути
@@ -176,9 +245,23 @@ def check_text_on_page(url, text_to_find, timeout=10):
         # Получение текста страницы
         page_text = soup.get_text(separator=' ', strip=True)
 
+        # Переменные для хранения контекста
+        context = None
+        
         # Сначала проверяем точное совпадение
-        text_found = text_to_find.strip() in page_text
+        search_text = text_to_find.strip()
+        position = page_text.find(search_text)
+        text_found = position != -1
         match_type = 'exact' if text_found else None
+        
+        if text_found:
+            # Извлекаем контекст для точного совпадения
+            before, found, after = extract_context(page_text, position, len(search_text))
+            context = {
+                'before': before,
+                'found': found,
+                'after': after
+            }
 
         # Если точное совпадение не найдено, пробуем гибкий поиск
         if not text_found:
@@ -186,38 +269,99 @@ def check_text_on_page(url, text_to_find, timeout=10):
             cleaned_page_text = clean_text_for_search(page_text)
 
             # Ищем очищенный текст в очищенной странице
-            if cleaned_search_text and len(cleaned_search_text) > 3:
+            if cleaned_search_text and len(cleaned_search_text) > MIN_FUZZY_TEXT_LENGTH:
                 # Сначала пробуем найти полное совпадение очищенного текста
-                text_found = cleaned_search_text in cleaned_page_text
+                cleaned_position = cleaned_page_text.find(cleaned_search_text)
+                text_found = cleaned_position != -1
+                
+                if text_found:
+                    # Для fuzzy match нужно найти соответствующую позицию в оригинальном тексте
+                    # Подсчитываем количество слов до найденной позиции в очищенном тексте
+                    words_before_match = len(cleaned_page_text[:cleaned_position].split())
+                    
+                    # Находим примерную позицию в оригинальном тексте
+                    original_words = page_text.split()
+                    if words_before_match < len(original_words):
+                        # Находим позицию начала слова в оригинальном тексте
+                        word_count = 0
+                        original_position = 0
+                        for i, char in enumerate(page_text):
+                            if char.isspace() and i > 0 and not page_text[i-1].isspace():
+                                word_count += 1
+                                if word_count >= words_before_match:
+                                    original_position = i
+                                    break
+                        
+                        # Извлекаем контекст из оригинального текста
+                        match_length = len(cleaned_search_text.split()) * 10  # Примерная длина
+                        before, found, after = extract_context(page_text, original_position, match_length)
+                        context = {
+                            'before': before,
+                            'found': found,
+                            'after': after
+                        }
 
                 # Если не найдено полное совпадение, ищем ключевые слова
                 if not text_found and len(cleaned_search_text.split()) >= 2:
-                    # Ищем хотя бы 2 ключевых слова из очищенного текста
+                    # Ищем общие слова между поисковым текстом и страницей
                     search_words = set(cleaned_search_text.split())
                     page_words = set(cleaned_page_text.split())
                     common_words = search_words.intersection(page_words)
-
-                    # Если найдено хотя бы 2 общих слова, считаем это fuzzy match
-                    if len(common_words) >= 2:
+                    
+                    # Вычисляем процент совпадения
+                    match_ratio = len(common_words) / len(search_words) if len(search_words) > 0 else 0
+                    
+                    # Проверяем оба условия: процент И абсолютный минимум
+                    if (match_ratio >= MIN_MATCH_RATIO and 
+                        len(common_words) >= MIN_COMMON_WORDS_ABSOLUTE):
                         text_found = True
-                        logger.debug(f"Fuzzy match found via keywords: {common_words} from '{cleaned_search_text}'")
+                        logger.debug(f"Fuzzy match found via keywords: {common_words} from '{cleaned_search_text}' "
+                                   f"(match ratio: {match_ratio:.2%}, {len(common_words)}/{len(search_words)} words)")
+                        
+                        # Для keyword match находим первое общее слово и показываем контекст вокруг него
+                        first_common_word = list(common_words)[0]
+                        word_position = cleaned_page_text.find(first_common_word)
+                        
+                        if word_position != -1:
+                            # Находим позицию в оригинальном тексте
+                            words_before_match = len(cleaned_page_text[:word_position].split())
+                            original_words = page_text.split()
+                            
+                            if words_before_match < len(original_words):
+                                word_count = 0
+                                original_position = 0
+                                for i, char in enumerate(page_text):
+                                    if char.isspace() and i > 0 and not page_text[i-1].isspace():
+                                        word_count += 1
+                                        if word_count >= words_before_match:
+                                            original_position = i
+                                            break
+                                
+                                match_length = len(first_common_word) * 2
+                                before, found, after = extract_context(page_text, original_position, match_length)
+                                context = {
+                                    'before': before,
+                                    'found': found,
+                                    'after': after,
+                                    'common_words': list(common_words)
+                                }
 
                 if text_found:
                     match_type = 'fuzzy'
                     logger.debug(f"Fuzzy match found: '{cleaned_search_text}' in cleaned page text")
 
-        return text_found, None, match_type
+        return text_found, None, match_type, context
         
     except requests.exceptions.Timeout:
-        return False, f"Timeout when accessing {url}", None
+        return False, f"Timeout when accessing {url}", None, None
     except requests.exceptions.ConnectionError:
-        return False, f"Connection error to {url}", None
+        return False, f"Connection error to {url}", None, None
     except requests.exceptions.HTTPError as e:
-        return False, f"HTTP error {e.response.status_code} for {url}", None
+        return False, f"HTTP error {e.response.status_code} for {url}", None, None
     except requests.exceptions.RequestException as e:
-        return False, f"Request error: {str(e)}", None
+        return False, f"Request error: {str(e)}", None, None
     except Exception as e:
-        return False, f"Unexpected error: {str(e)}", None
+        return False, f"Unexpected error: {str(e)}", None, None
 
 def process_excel_file(filename, delay=1, sheet_names=None, csv_output=None):
     """
@@ -299,7 +443,7 @@ def process_excel_file(filename, delay=1, sheet_names=None, csv_output=None):
                 logger.info(f"Link: {link}")
 
                 # Проверка наличия текста на странице
-                found, error, match_type = check_text_on_page(link, text)
+                found, error, match_type, context = check_text_on_page(link, text)
 
                 if error:
                     logger.error(f"Row {idx} (sheet '{sheet_name}'): ERROR - {error}")
@@ -308,6 +452,17 @@ def process_excel_file(filename, delay=1, sheet_names=None, csv_output=None):
                     match_indicator = "✓" if match_type == 'exact' else "≈"
                     match_desc = "exact match" if match_type == 'exact' else "fuzzy match"
                     logger.info(f"Row {idx} (sheet '{sheet_name}'): {match_indicator} FOUND ({match_desc}) - Text present on page")
+                    
+                    # Логируем контекст найденного текста
+                    if context:
+                        logger.info(f"  Context:")
+                        if context.get('before'):
+                            logger.info(f"    Before: ...{context['before'][-200:]}")
+                        logger.info(f"    Found:  [{context.get('found', '')}]")
+                        if context.get('after'):
+                            logger.info(f"    After:  {context['after'][:200]}...")
+                        if 'common_words' in context:
+                            logger.info(f"    Common words: {', '.join(context['common_words'])}")
 
                     # Добавляем найденное совпадение в список для CSV
                     found_matches.append((link, text))
@@ -375,7 +530,7 @@ def check_single_url(url, text, csv_output=None):
     logger.info("="*80)
     
     # Проверка наличия текста на странице
-    found, error, match_type = check_text_on_page(url, text)
+    found, error, match_type, context = check_text_on_page(url, text)
     
     if error:
         logger.error(f"ERROR: {error}")
@@ -386,6 +541,27 @@ def check_single_url(url, text, csv_output=None):
         match_desc = "exact match" if match_type == 'exact' else "fuzzy match"
         logger.info(f"{match_indicator} FOUND ({match_desc}) - Text present on page")
         print(f"\n✓ FOUND ({match_desc}) - Text present on page")
+        
+        # Логируем контекст найденного текста
+        if context:
+            logger.info(f"\nContext:")
+            if context.get('before'):
+                logger.info(f"  Before: ...{context['before'][-200:]}")
+            logger.info(f"  Found:  [{context.get('found', '')}]")
+            if context.get('after'):
+                logger.info(f"  After:  {context['after'][:200]}...")
+            if 'common_words' in context:
+                logger.info(f"  Common words: {', '.join(context['common_words'])}")
+            
+            # Выводим контекст в консоль
+            print(f"\nContext:")
+            if context.get('before'):
+                print(f"  Before: ...{context['before'][-200:]}")
+            print(f"  Found:  [{context.get('found', '')}]")
+            if context.get('after'):
+                print(f"  After:  {context['after'][:200]}...")
+            if 'common_words' in context:
+                print(f"  Common words: {', '.join(context['common_words'])}")
         
         # Сохраняем в CSV если указано
         if csv_output:
