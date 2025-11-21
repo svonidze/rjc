@@ -94,12 +94,18 @@ def setup_logging(log_dir=None):
     if created_dir:
         logger.info(f"Created logs directory: {log_dir}")
 
-def clean_text_for_search(text):
+def clean_text_for_search(text, remove_digits=False):
     """
     Очищает текст от специальных символов для более гибкого поиска
+    
+    Удаляет:
+    - Конструкции [id123|текст] → оставляет только "текст"
+    - Спецсимволы и знаки препинания → заменяются на пробелы
+    - Опционально: слова с цифрами (если remove_digits=True)
 
     Args:
         text: Исходный текст
+        remove_digits: Если True, удаляет слова содержащие цифры и сами цифры
 
     Returns:
         str: Очищенный текст
@@ -107,11 +113,47 @@ def clean_text_for_search(text):
     if not text or not isinstance(text, str):
         return ""
 
-    # Удаляем специальные символы, оставляя только буквы, цифры и пробелы
-    # Убираем знаки препинания, скобки, кавычки и другие спецсимволы
-    cleaned = re.sub(r'[^\w\s]', ' ', text)
-
-    # Заменяем множественные пробелы на один
+    # Шаг 1: Удаляем конструкции типа [id123|текст] или [club456|название]
+    # Оставляем только текст после |, если он есть
+    cleaned = re.sub(r'\[(?:id|club)\d+\|([^\]]+)\]', r'\1', text)
+    
+    # Шаг 2: Удаляем оставшиеся квадратные скобки и их содержимое
+    cleaned = re.sub(r'\[[^\]]*\]', ' ', cleaned)
+    
+    # Шаг 3: Удаляем все спецсимволы, оставляя только буквы, цифры и пробелы
+    cleaned = re.sub(r'[^\w\s]', ' ', cleaned)
+    
+    # Шаг 4: Опционально удаляем цифры и слова с цифрами
+    if remove_digits:
+        # Сначала запоминаем, какие слова содержали цифры
+        words = cleaned.split()
+        words_with_digits = set()
+        for word in words:
+            if re.search(r'\d', word):
+                words_with_digits.add(word)
+        
+        # Удаляем все цифры из текста
+        cleaned = re.sub(r'\d+', ' ', cleaned)
+        
+        # Теперь удаляем фрагменты слов, которые остались от слов с цифрами
+        # Например: "id123" → "id" (удаляем), "Текст123" → "Текст" (оставляем)
+        words_after = cleaned.split()
+        words_filtered = []
+        
+        for word in words_after:
+            # Если это фрагмент слова, которое содержало цифры
+            # и длина < 3, то удаляем (это "id", "vk" и т.п.)
+            is_fragment = any(orig_word.startswith(word) or orig_word.endswith(word) 
+                            for orig_word in words_with_digits)
+            
+            if is_fragment and len(word) <= 2:
+                continue  # Пропускаем короткие фрагменты
+            else:
+                words_filtered.append(word)
+        
+        cleaned = ' '.join(words_filtered)
+    
+    # Шаг 5: Заменяем множественные пробелы на один
     cleaned = re.sub(r'\s+', ' ', cleaned)
 
     # Убираем пробелы в начале и конце
@@ -270,8 +312,13 @@ def check_text_on_page(url, text_to_find, timeout=10):
 
         # Если точное совпадение не найдено, пробуем гибкий поиск
         if not text_found:
-            cleaned_search_text = clean_text_for_search(text_to_find)
-            cleaned_page_text = clean_text_for_search(page_text)
+            # Уровень 1: Очистка БЕЗ удаления цифр
+            cleaned_search_text = clean_text_for_search(text_to_find, remove_digits=False)
+            cleaned_page_text = clean_text_for_search(page_text, remove_digits=False)
+            
+            # Логируем очищенный текст для отладки
+            logger.debug(f"Original search text: '{text_to_find}'")
+            logger.debug(f"Cleaned search text (level 1): '{cleaned_search_text}'")
 
             # Ищем очищенный текст в очищенной странице
             if cleaned_search_text and len(cleaned_search_text) > MIN_FUZZY_TEXT_LENGTH:
@@ -281,30 +328,58 @@ def check_text_on_page(url, text_to_find, timeout=10):
                 
                 if text_found:
                     # Для fuzzy match нужно найти соответствующую позицию в оригинальном тексте
-                    # Подсчитываем количество слов до найденной позиции в очищенном тексте
-                    words_before_match = len(cleaned_page_text[:cleaned_position].split())
+                    # Стратегия: найти фрагмент оригинального текста, который после очистки даст нашу находку
                     
-                    # Находим примерную позицию в оригинальном тексте
-                    original_words = page_text.split()
-                    if words_before_match < len(original_words):
-                        # Находим позицию начала слова в оригинальном тексте
-                        word_count = 0
-                        original_position = 0
-                        for i, char in enumerate(page_text):
-                            if char.isspace() and i > 0 and not page_text[i-1].isspace():
-                                word_count += 1
-                                if word_count >= words_before_match:
-                                    original_position = i
-                                    break
+                    # Берем несколько первых слов из найденной последовательности для более точного поиска
+                    search_words = cleaned_search_text.split()[:3]  # Первые 3 слова
+                    search_pattern = ' '.join(search_words)
+                    
+                    # Ищем этот паттерн во всех возможных местах оригинального текста
+                    best_match_pos = -1
+                    best_match_score = 0
+                    
+                    # Проходим по оригинальному тексту и ищем место, где после очистки будет наш паттерн
+                    for i in range(len(page_text)):
+                        # Берем фрагмент оригинального текста
+                        fragment = page_text[i:i+len(cleaned_search_text)*3]
+                        if not fragment:
+                            continue
                         
+                        # Очищаем фрагмент
+                        cleaned_fragment = clean_text_for_search(fragment, remove_digits=False)
+                        
+                        # Проверяем, начинается ли очищенный фрагмент с нашего паттерна
+                        if cleaned_fragment.startswith(search_pattern):
+                            # Проверяем, сколько слов совпадает
+                            fragment_words = cleaned_fragment.split()
+                            match_count = 0
+                            for j, word in enumerate(search_words):
+                                if j < len(fragment_words) and fragment_words[j] == word:
+                                    match_count += 1
+                                else:
+                                    break
+                            
+                            if match_count > best_match_score:
+                                best_match_score = match_count
+                                best_match_pos = i
+                                
+                                # Если нашли полное совпадение первых слов, можно остановиться
+                                if match_count == len(search_words):
+                                    break
+                    
+                    if best_match_pos != -1:
                         # Извлекаем контекст из оригинального текста
-                        match_length = len(cleaned_search_text.split()) * 10  # Примерная длина
-                        before, found, after = extract_context(page_text, original_position, match_length)
+                        match_length = len(cleaned_search_text)
+                        before, found, after = extract_context(page_text, best_match_pos, match_length)
                         context = {
                             'before': before,
                             'found': found,
-                            'after': after
+                            'after': after,
+                            'cleaned_search': cleaned_search_text,
+                            'match_type': 'full_cleaned'
                         }
+                        
+                        logger.debug(f"Found position in original text: {best_match_pos}, pattern: '{search_pattern}'")
 
                 # Если не найдено полное совпадение, ищем слова в правильном порядке
                 if not text_found and len(cleaned_search_text.split()) >= 2:
@@ -356,28 +431,16 @@ def check_text_on_page(url, text_to_find, timeout=10):
                         logger.debug(f"Fuzzy match found via sequence: {found_sequence} from '{cleaned_search_text}' "
                                    f"(match ratio: {match_ratio:.2%}, {len(found_sequence)}/{len(search_words_list)} words in order)")
                         
-                        if sequence_start_pos != -1:
-                            # Находим позицию в оригинальном тексте
-                            words_before_match = sequence_start_pos
-                            original_words = page_text.split()
+                        if sequence_start_pos != -1 and found_sequence:
+                            # Находим позицию в оригинальном тексте по первому слову последовательности
+                            first_word = found_sequence[0]
                             
-                            if words_before_match < len(original_words):
-                                # Находим позицию начала последовательности в оригинальном тексте
-                                word_count = 0
-                                original_position = 0
-                                for i, char in enumerate(page_text):
-                                    if char.isspace() and i > 0 and not page_text[i-1].isspace():
-                                        word_count += 1
-                                        if word_count >= words_before_match:
-                                            original_position = i
-                                            break
-                                
+                            # Ищем первое слово в оригинальном тексте (игнорируя регистр)
+                            original_position = page_text.lower().find(first_word.lower())
+                            
+                            if original_position != -1:
                                 # Вычисляем длину найденной последовательности
-                                sequence_length = sequence_end_pos - sequence_start_pos + 1
-                                match_length = sum(len(original_words[i]) for i in range(
-                                    words_before_match, 
-                                    min(words_before_match + sequence_length, len(original_words))
-                                )) + sequence_length * 5  # Добавляем примерную длину пробелов
+                                match_length = len(' '.join(found_sequence)) * 2
                                 
                                 before, found, after = extract_context(page_text, original_position, match_length)
                                 
@@ -389,10 +452,117 @@ def check_text_on_page(url, text_to_find, timeout=10):
                                     'missing_words': missing_words if missing_words else None,
                                     'match_ratio': f"{match_ratio:.0%}"
                                 }
+                                
+                                logger.debug(f"Found sequence position in original text: {original_position}, first word: '{first_word}'")
 
                 if text_found:
                     match_type = 'fuzzy'
                     logger.debug(f"Fuzzy match found: '{cleaned_search_text}' in cleaned page text")
+                
+                # Уровень 2: Если не найдено, пробуем с удалением цифр
+                if not text_found:
+                    logger.debug("Level 1 search failed, trying level 2 (remove digits)")
+                    
+                    cleaned_search_text_no_digits = clean_text_for_search(text_to_find, remove_digits=True)
+                    cleaned_page_text_no_digits = clean_text_for_search(page_text, remove_digits=True)
+                    
+                    logger.debug(f"Cleaned search text (level 2, no digits): '{cleaned_search_text_no_digits}'")
+                    
+                    if cleaned_search_text_no_digits and len(cleaned_search_text_no_digits) > MIN_FUZZY_TEXT_LENGTH:
+                        # Проверяем полное совпадение без цифр
+                        cleaned_position = cleaned_page_text_no_digits.find(cleaned_search_text_no_digits)
+                        text_found = cleaned_position != -1
+                        
+                        if text_found:
+                            # Находим позицию по первому слову
+                            first_word = cleaned_search_text_no_digits.split()[0] if cleaned_search_text_no_digits.split() else ""
+                            
+                            if first_word:
+                                # Ищем первое слово в оригинальном тексте
+                                approx_start = max(0, cleaned_position - 100)
+                                search_area = page_text[approx_start:]
+                                original_position = search_area.lower().find(first_word.lower())
+                                
+                                if original_position != -1:
+                                    original_position += approx_start
+                                    
+                                    match_length = len(cleaned_search_text_no_digits)
+                                    before, found, after = extract_context(page_text, original_position, match_length)
+                                    context = {
+                                        'before': before,
+                                        'found': found,
+                                        'after': after,
+                                        'cleaned_search': cleaned_search_text_no_digits,
+                                        'match_type': 'full_cleaned_no_digits'
+                                    }
+                                    match_type = 'fuzzy'
+                                    logger.debug(f"Fuzzy match found (level 2): '{cleaned_search_text_no_digits}', first word: '{first_word}'")
+                        
+                        # Если полное совпадение не найдено, ищем последовательность без цифр
+                        if not text_found and len(cleaned_search_text_no_digits.split()) >= 2:
+                            search_words_list = cleaned_search_text_no_digits.split()
+                            page_words_list = cleaned_page_text_no_digits.split()
+                            
+                            found_sequence = []
+                            search_idx = 0
+                            page_idx = 0
+                            sequence_start_pos = -1
+                            sequence_end_pos = -1
+                            words_skipped = 0
+                            
+                            while search_idx < len(search_words_list) and page_idx < len(page_words_list):
+                                if search_words_list[search_idx] == page_words_list[page_idx]:
+                                    if sequence_start_pos == -1:
+                                        sequence_start_pos = page_idx
+                                    found_sequence.append(search_words_list[search_idx])
+                                    sequence_end_pos = page_idx
+                                    search_idx += 1
+                                    page_idx += 1
+                                    words_skipped = 0
+                                else:
+                                    page_idx += 1
+                                    words_skipped += 1
+                                    
+                                    if words_skipped > MAX_WORDS_BETWEEN:
+                                        search_idx = 0
+                                        found_sequence = []
+                                        sequence_start_pos = -1
+                                        words_skipped = 0
+                            
+                            match_ratio = len(found_sequence) / len(search_words_list) if len(search_words_list) > 0 else 0
+                            
+                            if (match_ratio >= MIN_MATCH_RATIO and 
+                                len(found_sequence) >= MIN_WORDS_IN_SEQUENCE):
+                                text_found = True
+                                missing_words = [w for w in search_words_list if w not in found_sequence]
+                                
+                                logger.debug(f"Fuzzy match found via sequence (level 2): {found_sequence} "
+                                           f"(match ratio: {match_ratio:.2%}, {len(found_sequence)}/{len(search_words_list)} words in order)")
+                                
+                                if sequence_start_pos != -1 and found_sequence:
+                                    # Находим позицию по первому слову последовательности
+                                    first_word = found_sequence[0]
+                                    
+                                    # Ищем первое слово в оригинальном тексте
+                                    original_position = page_text.lower().find(first_word.lower())
+                                    
+                                    if original_position != -1:
+                                        match_length = len(' '.join(found_sequence)) * 2
+                                        
+                                        before, found, after = extract_context(page_text, original_position, match_length)
+                                        
+                                        context = {
+                                            'before': before,
+                                            'found': found,
+                                            'after': after,
+                                            'found_words': found_sequence,
+                                            'missing_words': missing_words if missing_words else None,
+                                            'match_ratio': f"{match_ratio:.0%}",
+                                            'cleaned_search': cleaned_search_text_no_digits
+                                        }
+                                        match_type = 'fuzzy'
+                                        
+                                        logger.debug(f"Found sequence (level 2) position in original text: {original_position}, first word: '{first_word}'")
 
         return text_found, None, match_type, context
         
@@ -484,6 +654,12 @@ def process_excel_file(filename, delay=1, sheet_names=None, csv_output=None):
                 link = str(link).strip()
 
                 logger.info(f"Text to search: {text[:100]}{'...' if len(text) > 100 else ''}")
+                
+                # Показываем очищенный текст для fuzzy поиска
+                cleaned = clean_text_for_search(text)
+                if cleaned != text:
+                    logger.info(f"Cleaned text for fuzzy search: {cleaned[:100]}{'...' if len(cleaned) > 100 else ''}")
+                
                 logger.info(f"Link: {link}")
 
                 # Проверка наличия текста на странице
@@ -505,6 +681,8 @@ def process_excel_file(filename, delay=1, sheet_names=None, csv_output=None):
                         logger.info(f"    Found:  [{context.get('found', '')}]")
                         if context.get('after'):
                             logger.info(f"    After:  {context['after'][:200]}...")
+                        if 'cleaned_search' in context:
+                            logger.info(f"    Cleaned search text: {context['cleaned_search']}")
                         if 'found_words' in context:
                             logger.info(f"    Found words (in order): {', '.join(context['found_words'])}")
                         if 'missing_words' in context and context['missing_words']:
@@ -575,6 +753,12 @@ def check_single_url(url, text, csv_output=None):
     logger.info("Single URL check mode")
     logger.info(f"URL: {url}")
     logger.info(f"Text to search: {text[:100]}{'...' if len(text) > 100 else ''}")
+    
+    # Показываем очищенный текст для fuzzy поиска
+    cleaned = clean_text_for_search(text)
+    if cleaned != text.strip():
+        logger.info(f"Cleaned text for fuzzy search: {cleaned[:100]}{'...' if len(cleaned) > 100 else ''}")
+    
     logger.info("="*80)
     
     # Проверка наличия текста на странице
@@ -608,6 +792,8 @@ def check_single_url(url, text, csv_output=None):
             print(f"  Found:  [{context.get('found', '')}]")
             if context.get('after'):
                 print(f"  After:  {context['after'][:200]}...")
+            if 'cleaned_search' in context:
+                print(f"  Cleaned search text: {context['cleaned_search']}")
             if 'found_words' in context:
                 print(f"  Found words (in order): {', '.join(context['found_words'])}")
             if 'missing_words' in context and context['missing_words']:
