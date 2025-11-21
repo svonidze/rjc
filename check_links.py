@@ -359,6 +359,46 @@ def process_excel_file(filename, delay=1, sheet_names=None, csv_output=None):
         logger.error(f"Critical error processing file: {str(e)}")
         raise
 
+def check_single_url(url, text, csv_output=None):
+    """
+    Проверяет наличие текста на одной веб-странице
+
+    Args:
+        url: URL для проверки
+        text: Текст для поиска
+        csv_output: Путь к CSV файлу для сохранения результата
+    """
+    logger.info("="*80)
+    logger.info("Single URL check mode")
+    logger.info(f"URL: {url}")
+    logger.info(f"Text to search: {text[:100]}{'...' if len(text) > 100 else ''}")
+    logger.info("="*80)
+    
+    # Проверка наличия текста на странице
+    found, error, match_type = check_text_on_page(url, text)
+    
+    if error:
+        logger.error(f"ERROR: {error}")
+        print(f"\n❌ ERROR: {error}")
+        return False
+    elif found:
+        match_indicator = "✓" if match_type == 'exact' else "≈"
+        match_desc = "exact match" if match_type == 'exact' else "fuzzy match"
+        logger.info(f"{match_indicator} FOUND ({match_desc}) - Text present on page")
+        print(f"\n✓ FOUND ({match_desc}) - Text present on page")
+        
+        # Сохраняем в CSV если указано
+        if csv_output:
+            if save_found_matches_to_csv([(url, text)], csv_output):
+                logger.info(f"Result saved to CSV: {csv_output}")
+                print(f"Result saved to CSV: {csv_output}")
+        
+        return True
+    else:
+        logger.warning("✗ NOT FOUND - Text absent from page")
+        print("\n✗ NOT FOUND - Text absent from page")
+        return False
+
 def main():
     """Главная функция"""
     # Настройка парсера аргументов командной строки
@@ -367,19 +407,37 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Excel file mode
   python check_links.py data.xlsx  # Default logs in logs/ directory
   python check_links.py data.xlsx --log-dir my_logs  # Custom log directory
   python check_links.py data.xlsx --all-sheets  # Process all sheets
-  python check_links.py data.xlsx --sheets 0 2  # Process sheets by index
-  python check_links.py data.xlsx --output-csv results.csv  # Custom CSV filename
-  python check_links.py data.xlsx --delay 2 --timeout 15 --log-dir ./run_logs  # Full example
+  
+  # Direct URL check mode
+  python check_links.py --url https://example.com --text "Search text"  # Check single URL
+  python check_links.py --url https://example.com --text "Text" --log-dir ./logs  # With custom log dir
         """
     )
     
-    parser.add_argument(
+    # Создаем группу взаимоисключающих аргументов для режима работы
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    
+    mode_group.add_argument(
         'excel_file',
+        nargs='?',
         type=str,
         help='Path to Excel file to process'
+    )
+    
+    mode_group.add_argument(
+        '--url',
+        type=str,
+        help='Single URL to check (requires --text)'
+    )
+    
+    parser.add_argument(
+        '--text',
+        type=str,
+        help='Text to search on the page (used with --url)'
     )
 
     parser.add_argument(
@@ -428,14 +486,49 @@ Examples:
     # Парсинг аргументов
     args = parser.parse_args()
     
-    # Проверка существования файла
-    if not os.path.exists(args.excel_file):
-        print(f"Error: File '{args.excel_file}' not found!")
+    # Проверка аргументов в зависимости от режима работы
+    if args.url:
+        # Режим проверки одного URL
+        if not args.text:
+            parser.error("--url requires --text argument")
+            sys.exit(1)
+    elif args.excel_file:
+        # Режим обработки Excel файла
+        if args.text:
+            parser.error("--text can only be used with --url")
+            sys.exit(1)
+        
+        # Проверка существования файла
+        if not os.path.exists(args.excel_file):
+            print(f"Error: File '{args.excel_file}' not found!")
+            sys.exit(1)
+    else:
+        parser.error("Either excel_file or --url with --text must be provided")
         sys.exit(1)
 
     # Настраиваем логирование
     setup_logging(args.log_dir)
 
+    # Обработка режима с одиночным URL
+    if args.url:
+        # Автоматическая генерация имени CSV файла для одиночного URL
+        csv_output = args.output_csv
+        if csv_output is None and args.output_csv != '':
+            # Не генерируем автоматически для одиночного URL, только если явно указано
+            csv_output = None
+        
+        print(f"Log file: {log_filename}")
+        if csv_output:
+            print(f"CSV output: {csv_output}")
+        print("")
+        
+        # Проверяем одиночный URL
+        success = check_single_url(args.url, args.text, csv_output)
+        
+        print(f"\nLog saved to: {log_filename}")
+        sys.exit(0 if success else 1)
+    
+    # Режим обработки Excel файла
     # Автоматическая генерация имени CSV файла, если не указано
     csv_output = args.output_csv
     if csv_output is None:
