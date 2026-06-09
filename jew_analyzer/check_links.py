@@ -12,8 +12,11 @@ import time
 import argparse
 import re
 import csv
+import random
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 import sys
 import os
 
@@ -47,6 +50,19 @@ MAX_WORDS_BETWEEN = 1
 # Количество слов контекста вокруг найденного текста для логирования
 CONTEXT_WORDS_BEFORE = 20  # Слов до найденного текста
 CONTEXT_WORDS_AFTER = 20   # Слов после найденного текста
+
+# Минимальная длина нормализованного message-поля для срабатывания префиксного
+# (truncated) совпадения — защита от ложных ЖИВ по слишком короткому фрагменту.
+MIN_MATCH_CHARS = 12
+
+# Статусы проверки (единые во всём пайплайне)
+STATUS_ALIVE = "ЖИВ"
+STATUS_DELETED = "УДАЛЁН"
+STATUS_ERROR = "ОШИБКА"
+
+# Хосты Telegram, для которых текст сообщения берётся из message-полей (og/виджет),
+# а не из soup.get_text() (там — заглушка «View in Telegram»).
+TELEGRAM_HOSTS = {"t.me", "telegram.me", "telegram.dog"}
 
 # ============================================================================
 # НАСТРОЙКИ HTTP ЗАПРОСОВ
@@ -159,6 +175,220 @@ def clean_text_for_search(text, remove_digits=False):
     # Убираем пробелы в начале и конце
     return cleaned.strip()
 
+# ============================================================================
+# ЧИСТЫЕ ФУНКЦИИ СОПОСТАВЛЕНИЯ (без сети — тестируются в test_matching.py)
+# ============================================================================
+
+# Всё, кроме букв (лат./кир.) и цифр, считаем разделителем.
+_NORMALIZE_RE = re.compile(r'[^0-9a-zA-Zа-яёА-ЯЁ]+')
+
+
+def normalize(text):
+    """
+    Нормализует текст для сравнения: нижний регистр, все спецсимволы/пунктуация →
+    пробел (кириллица сохраняется), повторные пробелы схлопываются.
+    """
+    if not text:
+        return ""
+    return _NORMALIZE_RE.sub(' ', str(text).lower()).strip()
+
+
+def is_telegram_host(url):
+    """True, если URL ведёт на страницу сообщения Telegram (t.me / telegram.me)."""
+    try:
+        host = urlsplit(str(url)).netloc.lower().split(':')[0]
+    except Exception:
+        return False
+    if host.startswith('www.'):
+        host = host[4:]
+    return host in TELEGRAM_HOSTS
+
+
+def extract_page_message(soup):
+    """
+    Извлекает высокосигнальные «поля сообщения» страницы.
+
+    Для Telegram текст поста/комментария лежит в og:description (а НЕ в видимом
+    теле страницы). og:title намеренно НЕ берём — это имя канала/автора.
+
+    Returns:
+        dict: {'message_fields': [str, ...], 'body_text': str}
+    """
+    message_fields = []
+
+    og_desc = soup.find('meta', attrs={'property': 'og:description'})
+    if og_desc and og_desc.get('content'):
+        message_fields.append(og_desc['content'])
+
+    tw_desc = soup.find('meta', attrs={'name': 'twitter:description'})
+    if tw_desc and tw_desc.get('content'):
+        message_fields.append(tw_desc['content'])
+
+    for div in soup.select('div.tgme_widget_message_text'):
+        txt = div.get_text(' ', strip=True)
+        if txt:
+            message_fields.append(txt)
+
+    body_text = soup.get_text(separator=' ', strip=True)
+    return {'message_fields': message_fields, 'body_text': body_text}
+
+
+def _fuzzy_sequence_match(search_words, page_words):
+    """
+    Ищет максимальную последовательность слов search_words в page_words в том же
+    порядке, с допуском не более MAX_WORDS_BETWEEN лишних слов между совпадениями.
+
+    Returns:
+        list: найденная последовательность слов (по порядку).
+    """
+    found_sequence = []
+    search_idx = 0
+    page_idx = 0
+    words_skipped = 0
+
+    while search_idx < len(search_words) and page_idx < len(page_words):
+        if search_words[search_idx] == page_words[page_idx]:
+            found_sequence.append(search_words[search_idx])
+            search_idx += 1
+            page_idx += 1
+            words_skipped = 0
+        else:
+            page_idx += 1
+            words_skipped += 1
+            if words_skipped > MAX_WORDS_BETWEEN:
+                search_idx = 0
+                found_sequence = []
+                words_skipped = 0
+
+    return found_sequence
+
+
+def _match_body_legacy(search_text, body_text):
+    """
+    Legacy-сопоставление по видимому тексту страницы (не-Telegram / локальные файлы).
+    Сохраняет прежнее поведение: точное вхождение, затем нечёткий поиск
+    последовательности слов (с очисткой, два уровня — без/с удалением цифр).
+
+    Returns:
+        tuple: (found: bool, match_type: str|None, snippet: str|None)
+    """
+    if search_text and search_text.strip() and search_text.strip() in body_text:
+        pos = body_text.find(search_text.strip())
+        _, found, _ = extract_context(body_text, pos, len(search_text.strip()))
+        return True, 'exact', found
+
+    for remove_digits in (False, True):
+        cleaned_search = clean_text_for_search(search_text, remove_digits=remove_digits)
+        cleaned_page = clean_text_for_search(body_text, remove_digits=remove_digits)
+        if not cleaned_search or len(cleaned_search) <= MIN_FUZZY_TEXT_LENGTH:
+            continue
+
+        if cleaned_search in cleaned_page:
+            return True, 'fuzzy', cleaned_search
+
+        search_words = cleaned_search.split()
+        if len(search_words) < 2:
+            continue
+        found_sequence = _fuzzy_sequence_match(search_words, cleaned_page.split())
+        ratio = len(found_sequence) / len(search_words) if search_words else 0
+        if ratio >= MIN_MATCH_RATIO and len(found_sequence) >= MIN_WORDS_IN_SEQUENCE:
+            return True, 'fuzzy', ' '.join(found_sequence)
+
+    return False, None, None
+
+
+def match_message(search_text, message_fields, body_text, is_telegram):
+    """
+    Чистое сопоставление искомого текста со страницей. Без сети.
+
+    Telegram: ищем ТОЛЬКО в message-полях (og:description/twitter/виджет) —
+      - ng in nc                          → ЖИВ (meta_exact)
+      - len(nc)>=MIN_MATCH_CHARS и ng.startswith(nc) → ЖИВ (meta_truncated, og обрезан)
+      Никакого нечёткого поиска по message-полям (избегаем ложных ЖИВ).
+      Нет ни одного непустого message-поля → ОШИБКА (заглушка/login/антибот).
+      Есть поле(я), но текст не совпал → УДАЛЁН.
+    Не-Telegram / локальный файл: legacy-поиск по body_text (exact + fuzzy);
+      найдено → ЖИВ, иначе УДАЛЁН.
+
+    Returns:
+        tuple: (status, match_type, snippet)
+    """
+    ng = normalize(search_text)
+    if not ng:
+        return STATUS_ERROR, None, None
+
+    if is_telegram:
+        nonempty = [(f, normalize(f)) for f in message_fields if normalize(f)]
+        if not nonempty:
+            return STATUS_ERROR, None, None
+        for original, nc in nonempty:
+            if ng in nc:
+                return STATUS_ALIVE, 'meta_exact', original.strip()
+            if len(nc) >= MIN_MATCH_CHARS and ng.startswith(nc):
+                return STATUS_ALIVE, 'meta_truncated', original.strip()
+        return STATUS_DELETED, None, None
+
+    found, match_type, snippet = _match_body_legacy(search_text, body_text)
+    return (STATUS_ALIVE if found else STATUS_DELETED), match_type, snippet
+
+
+def escape_csv_cell(value):
+    """
+    Защита от CSV-инъекций в Excel: значения, начинающиеся с = + - @ TAB CR,
+    префиксуются апострофом (OWASP CSV injection).
+    """
+    s = "" if value is None else str(value)
+    if s and s[0] in ('=', '+', '-', '@', '\t', '\r'):
+        return "'" + s
+    return s
+
+
+class RateLimiter:
+    """
+    Глобальный ограничитель частоты запросов с адаптивным замедлением.
+
+    - Разносит СТАРТЫ запросов минимум на 1/rate секунд (+ небольшой джиттер).
+    - При сериях троттлинга (429/timeout/conn) удваивает интервал (cap 5с).
+    - После окна успехов постепенно возвращает базовый темп.
+    """
+
+    def __init__(self, rate, jitter=(0.0, 0.0)):
+        self._base_interval = (1.0 / rate) if rate and rate > 0 else 0.0
+        self._min_interval = self._base_interval
+        self._jitter = jitter
+        self._next = 0.0
+        self._lock = threading.Lock()
+        self._consec_throttle = 0
+        self._consec_ok = 0
+
+    def acquire(self):
+        if self._base_interval <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            start = max(now, self._next)
+            extra = random.uniform(*self._jitter) if self._jitter[1] > 0 else 0.0
+            self._next = start + self._min_interval + extra
+        wait = start - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+
+    def report(self, throttled):
+        with self._lock:
+            if throttled:
+                self._consec_throttle += 1
+                self._consec_ok = 0
+                if self._consec_throttle >= 5:
+                    self._min_interval = min(max(self._min_interval, 0.05) * 2, 5.0)
+                    self._consec_throttle = 0
+            else:
+                self._consec_ok += 1
+                self._consec_throttle = 0
+                if self._consec_ok >= 20 and self._min_interval > self._base_interval:
+                    self._min_interval = max(self._base_interval, self._min_interval / 2)
+                    self._consec_ok = 0
+
+
 def save_found_matches_to_csv(matches, csv_filename):
     """
     Сохраняет найденные совпадения в CSV файл
@@ -228,511 +458,329 @@ def extract_context(text, position, match_length, words_before=CONTEXT_WORDS_BEF
     
     return before, found_text.strip(), after
 
-def check_text_on_page(url, text_to_find, timeout=10):
+def _sleep_backoff(attempt):
+    """Экспоненциальный бэкофф 1с/3с/6с (+джиттер), cap 60с."""
+    base = [1, 3, 6]
+    delay = min(60, base[min(attempt, len(base) - 1)]) + random.uniform(0, 0.5)
+    time.sleep(delay)
+
+
+# Маркеры транзиентных (повторяемых) ошибок — в отличие от детерминантных
+# (приватный канал / нет текста сообщения), которые повторять бессмысленно.
+_TRANSIENT_MARKERS = ('Timeout', 'ConnectionError', 'HTTP 4', 'HTTP 5',
+                      'Request error', 'Unknown error', 'HTTP error')
+
+
+def _is_transient_error(error_msg):
+    """True, если ошибку имеет смысл повторить (сетевая/троттлинг), а не детерминантную."""
+    if not error_msg:
+        return False
+    return any(marker in error_msg for marker in _TRANSIENT_MARKERS)
+
+
+def check_text_on_page(url, text_to_find, timeout=10, session=None, retries=0, rate_limiter=None):
     """
-    Проверяет наличие текста на веб-странице
+    Проверяет наличие текста на веб-странице (или в локальном файле).
+
+    Для Telegram текст ищется в message-полях (og:description/виджет), т.к. в
+    soup.get_text() лежит лишь заглушка «View in Telegram». Для остальных хостов —
+    legacy-поиск по видимому тексту.
 
     Args:
-        url: URL страницы
+        url: URL страницы или путь к локальному файлу
         text_to_find: Текст для поиска
         timeout: Таймаут запроса в секундах
+        session: requests.Session (None → модульный requests)
+        retries: число дополнительных попыток при троттлинге/сбое сети
+        rate_limiter: общий RateLimiter (None → без ограничения)
 
     Returns:
-        tuple: (найден ли текст, сообщение об ошибке если есть, тип совпадения, контекст)
-        тип совпадения: 'exact' - точное совпадение, 'fuzzy' - гибкое совпадение, None - не найдено
-        контекст: dict с ключами 'before', 'found', 'after' или None
+        tuple: (status, error, match_type, snippet)
+        status: STATUS_ALIVE / STATUS_DELETED / STATUS_ERROR
     """
-    try:
-        # Проверка валидности URL или локального пути
-        parsed = urlparse(url)
-        is_local_file = False
+    parsed = urlparse(url)
+    telegram = is_telegram_host(url)
 
-        if parsed.scheme in ('http', 'https'):
-            # Web URL
-            response = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
-            response.raise_for_status()
-        elif parsed.scheme == 'file' or os.path.exists(url):
-            # Локальный файл
-            is_local_file = True
+    # ---- Локальный файл (поведение сохранено) ----
+    if parsed.scheme not in ('http', 'https') and (parsed.scheme == 'file' or os.path.exists(url)):
+        try:
             if parsed.scheme == 'file':
                 file_path = parsed.path
-                # Убираем ведущий слэш для Windows путей
                 if file_path.startswith('/') and os.name == 'nt':
                     file_path = file_path[1:]
             else:
-                # Для Windows путей вида C:/path, urlparse неправильно разбирает scheme
-                # Используем оригинальный URL как путь к файлу
                 file_path = url
-
             if not os.path.exists(file_path):
-                return False, f"Local file not found: {file_path}", None, None
-
+                return STATUS_ERROR, f"Local file not found: {file_path}", None, None
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-            # Создаем объект, имитирующий requests response
-            class MockResponse:
-                def __init__(self, text):
-                    self.text = text
-                    self.status_code = 200
+            soup = BeautifulSoup(content, 'html.parser')
+            fields = extract_page_message(soup)
+            status, match_type, snippet = match_message(
+                text_to_find, fields['message_fields'], fields['body_text'], telegram)
+            return status, None, match_type, snippet
+        except Exception as e:
+            return STATUS_ERROR, f"Local file error: {e}", None, None
 
-                def raise_for_status(self):
-                    pass
+    if parsed.scheme not in ('http', 'https'):
+        return STATUS_ERROR, "Invalid URL or file path", None, None
 
-            response = MockResponse(content)
-        else:
-            return False, "Invalid URL or file path", None, None
-        
-        # Определение кодировки (только для веб-запросов)
-        if not is_local_file:
-            response.encoding = response.apparent_encoding
-        
-        # Парсинг HTML
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Получение текста страницы
-        page_text = soup.get_text(separator=' ', strip=True)
+    # ---- Веб-запрос с ретраями и адаптивным троттлингом ----
+    getter = session if session is not None else requests
+    last_error = None
+    for attempt in range(retries + 1):
+        if rate_limiter is not None:
+            rate_limiter.acquire()
+        try:
+            response = getter.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+            sc = response.status_code
+            if sc == 429 or sc >= 500:
+                if rate_limiter is not None:
+                    rate_limiter.report(True)
+                last_error = f"HTTP {sc} for {url}"
+                if attempt < retries:
+                    _sleep_backoff(attempt)
+                    continue
+                return STATUS_ERROR, last_error, None, None
+            response.raise_for_status()
+            if rate_limiter is not None:
+                rate_limiter.report(False)
+            if response.encoding is None:
+                response.encoding = response.apparent_encoding or 'utf-8'
+            soup = BeautifulSoup(response.text, 'html.parser')
+            fields = extract_page_message(soup)
+            status, match_type, snippet = match_message(
+                text_to_find, fields['message_fields'], fields['body_text'], telegram)
+            err = None
+            if status == STATUS_ERROR:
+                body_low = fields['body_text'].lower()
+                is_private = (
+                    urlsplit(url).path.startswith('/c/')
+                    or 'private group or channel' in body_low
+                    or 'only work if you are a member' in body_low
+                )
+                err = ("Приватный канал/группа — проверить вручную (нужно членство)"
+                       if is_private
+                       else "Нет текста сообщения на странице (заглушка/login/изменённая вёрстка)")
+            return status, err, match_type, snippet
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if rate_limiter is not None:
+                rate_limiter.report(True)
+            last_error = f"{type(e).__name__} for {url}"
+            if attempt < retries:
+                _sleep_backoff(attempt)
+                continue
+            return STATUS_ERROR, last_error, None, None
+        except requests.exceptions.HTTPError as e:
+            sc = e.response.status_code if e.response is not None else '?'
+            # 4xx (кроме 429) — окончательный ответ сервера, не ретраим
+            return STATUS_ERROR, f"HTTP error {sc} for {url}", None, None
+        except requests.exceptions.RequestException as e:
+            last_error = f"Request error: {e}"
+            if attempt < retries:
+                _sleep_backoff(attempt)
+                continue
+            return STATUS_ERROR, last_error, None, None
+        except Exception as e:
+            return STATUS_ERROR, f"Unexpected error: {e}", None, None
 
-        # Переменные для хранения контекста
-        context = None
-        
-        # Сначала проверяем точное совпадение
-        search_text = text_to_find.strip()
-        position = page_text.find(search_text)
-        text_found = position != -1
-        match_type = 'exact' if text_found else None
-        
-        if text_found:
-            # Извлекаем контекст для точного совпадения
-            before, found, after = extract_context(page_text, position, len(search_text))
-            context = {
-                'before': before,
-                'found': found,
-                'after': after
-            }
+    return STATUS_ERROR, last_error or "Unknown error", None, None
 
-        # Если точное совпадение не найдено, пробуем гибкий поиск
-        if not text_found:
-            # Уровень 1: Очистка БЕЗ удаления цифр
-            cleaned_search_text = clean_text_for_search(text_to_find, remove_digits=False)
-            cleaned_page_text = clean_text_for_search(page_text, remove_digits=False)
-            
-            # Логируем очищенный текст для отладки
-            logger.debug(f"Original search text: '{text_to_find}'")
-            logger.debug(f"Cleaned search text (level 1): '{cleaned_search_text}'")
 
-            # Ищем очищенный текст в очищенной странице
-            if cleaned_search_text and len(cleaned_search_text) > MIN_FUZZY_TEXT_LENGTH:
-                # Сначала пробуем найти полное совпадение очищенного текста
-                cleaned_position = cleaned_page_text.find(cleaned_search_text)
-                text_found = cleaned_position != -1
-                
-                if text_found:
-                    # Для fuzzy match нужно найти соответствующую позицию в оригинальном тексте
-                    # Стратегия: найти фрагмент оригинального текста, который после очистки даст нашу находку
-                    
-                    # Берем несколько первых слов из найденной последовательности для более точного поиска
-                    search_words = cleaned_search_text.split()[:3]  # Первые 3 слова
-                    search_pattern = ' '.join(search_words)
-                    
-                    # Ищем этот паттерн во всех возможных местах оригинального текста
-                    best_match_pos = -1
-                    best_match_score = 0
-                    
-                    # Проходим по оригинальному тексту и ищем место, где после очистки будет наш паттерн
-                    for i in range(len(page_text)):
-                        # Берем фрагмент оригинального текста
-                        fragment = page_text[i:i+len(cleaned_search_text)*3]
-                        if not fragment:
-                            continue
-                        
-                        # Очищаем фрагмент
-                        cleaned_fragment = clean_text_for_search(fragment, remove_digits=False)
-                        
-                        # Проверяем, начинается ли очищенный фрагмент с нашего паттерна
-                        if cleaned_fragment.startswith(search_pattern):
-                            # Проверяем, сколько слов совпадает
-                            fragment_words = cleaned_fragment.split()
-                            match_count = 0
-                            for j, word in enumerate(search_words):
-                                if j < len(fragment_words) and fragment_words[j] == word:
-                                    match_count += 1
-                                else:
-                                    break
-                            
-                            if match_count > best_match_score:
-                                best_match_score = match_count
-                                best_match_pos = i
-                                
-                                # Если нашли полное совпадение первых слов, можно остановиться
-                                if match_count == len(search_words):
-                                    break
-                    
-                    if best_match_pos != -1:
-                        # Извлекаем контекст из оригинального текста
-                        match_length = len(cleaned_search_text)
-                        before, found, after = extract_context(page_text, best_match_pos, match_length)
-                        context = {
-                            'before': before,
-                            'found': found,
-                            'after': after,
-                            'cleaned_search': cleaned_search_text,
-                            'match_type': 'full_cleaned'
-                        }
-                        
-                        logger.debug(f"Found position in original text: {best_match_pos}, pattern: '{search_pattern}'")
+_thread_local = threading.local()
 
-                # Если не найдено полное совпадение, ищем слова в правильном порядке
-                if not text_found and len(cleaned_search_text.split()) >= 2:
-                    # Разбиваем поисковый текст и текст страницы на слова
-                    search_words_list = cleaned_search_text.split()
-                    page_words_list = cleaned_page_text.split()
-                    
-                    # Ищем максимальную последовательность слов в правильном порядке
-                    # Используем алгоритм поиска подпоследовательности с ограничением на пропуски
-                    found_sequence = []
-                    search_idx = 0
-                    page_idx = 0
-                    sequence_start_pos = -1
-                    sequence_end_pos = -1
-                    words_skipped = 0
-                    
-                    while search_idx < len(search_words_list) and page_idx < len(page_words_list):
-                        if search_words_list[search_idx] == page_words_list[page_idx]:
-                            # Нашли слово в правильном порядке
-                            if sequence_start_pos == -1:
-                                sequence_start_pos = page_idx
-                            found_sequence.append(search_words_list[search_idx])
-                            sequence_end_pos = page_idx
-                            search_idx += 1
-                            page_idx += 1
-                            words_skipped = 0  # Сбрасываем счетчик пропусков
-                        else:
-                            # Слово не совпало, пропускаем слово на странице
-                            page_idx += 1
-                            words_skipped += 1
-                            
-                            # Если пропустили слишком много слов, начинаем заново
-                            if words_skipped > MAX_WORDS_BETWEEN:
-                                search_idx = 0
-                                found_sequence = []
-                                sequence_start_pos = -1
-                                words_skipped = 0
-                    
-                    # Вычисляем процент найденных слов в порядке
-                    match_ratio = len(found_sequence) / len(search_words_list) if len(search_words_list) > 0 else 0
-                    
-                    # Проверяем условия: процент И абсолютный минимум слов в последовательности
-                    if (match_ratio >= MIN_MATCH_RATIO and 
-                        len(found_sequence) >= MIN_WORDS_IN_SEQUENCE):
-                        text_found = True
-                        
-                        missing_words = [w for w in search_words_list if w not in found_sequence]
-                        
-                        logger.debug(f"Fuzzy match found via sequence: {found_sequence} from '{cleaned_search_text}' "
-                                   f"(match ratio: {match_ratio:.2%}, {len(found_sequence)}/{len(search_words_list)} words in order)")
-                        
-                        if sequence_start_pos != -1 and found_sequence:
-                            # Находим позицию в оригинальном тексте по первому слову последовательности
-                            first_word = found_sequence[0]
-                            
-                            # Ищем первое слово в оригинальном тексте (игнорируя регистр)
-                            original_position = page_text.lower().find(first_word.lower())
-                            
-                            if original_position != -1:
-                                # Вычисляем длину найденной последовательности
-                                match_length = len(' '.join(found_sequence)) * 2
-                                
-                                before, found, after = extract_context(page_text, original_position, match_length)
-                                
-                                context = {
-                                    'before': before,
-                                    'found': found,
-                                    'after': after,
-                                    'found_words': found_sequence,
-                                    'missing_words': missing_words if missing_words else None,
-                                    'match_ratio': f"{match_ratio:.0%}"
-                                }
-                                
-                                logger.debug(f"Found sequence position in original text: {original_position}, first word: '{first_word}'")
 
-                if text_found:
-                    match_type = 'fuzzy'
-                    logger.debug(f"Fuzzy match found: '{cleaned_search_text}' in cleaned page text")
-                
-                # Уровень 2: Если не найдено, пробуем с удалением цифр
-                if not text_found:
-                    logger.debug("Level 1 search failed, trying level 2 (remove digits)")
-                    
-                    cleaned_search_text_no_digits = clean_text_for_search(text_to_find, remove_digits=True)
-                    cleaned_page_text_no_digits = clean_text_for_search(page_text, remove_digits=True)
-                    
-                    logger.debug(f"Cleaned search text (level 2, no digits): '{cleaned_search_text_no_digits}'")
-                    
-                    if cleaned_search_text_no_digits and len(cleaned_search_text_no_digits) > MIN_FUZZY_TEXT_LENGTH:
-                        # Проверяем полное совпадение без цифр
-                        cleaned_position = cleaned_page_text_no_digits.find(cleaned_search_text_no_digits)
-                        text_found = cleaned_position != -1
-                        
-                        if text_found:
-                            # Находим позицию по первому слову
-                            first_word = cleaned_search_text_no_digits.split()[0] if cleaned_search_text_no_digits.split() else ""
-                            
-                            if first_word:
-                                # Ищем первое слово в оригинальном тексте
-                                approx_start = max(0, cleaned_position - 100)
-                                search_area = page_text[approx_start:]
-                                original_position = search_area.lower().find(first_word.lower())
-                                
-                                if original_position != -1:
-                                    original_position += approx_start
-                                    
-                                    match_length = len(cleaned_search_text_no_digits)
-                                    before, found, after = extract_context(page_text, original_position, match_length)
-                                    context = {
-                                        'before': before,
-                                        'found': found,
-                                        'after': after,
-                                        'cleaned_search': cleaned_search_text_no_digits,
-                                        'match_type': 'full_cleaned_no_digits'
-                                    }
-                                    match_type = 'fuzzy'
-                                    logger.debug(f"Fuzzy match found (level 2): '{cleaned_search_text_no_digits}', first word: '{first_word}'")
-                        
-                        # Если полное совпадение не найдено, ищем последовательность без цифр
-                        if not text_found and len(cleaned_search_text_no_digits.split()) >= 2:
-                            search_words_list = cleaned_search_text_no_digits.split()
-                            page_words_list = cleaned_page_text_no_digits.split()
-                            
-                            found_sequence = []
-                            search_idx = 0
-                            page_idx = 0
-                            sequence_start_pos = -1
-                            sequence_end_pos = -1
-                            words_skipped = 0
-                            
-                            while search_idx < len(search_words_list) and page_idx < len(page_words_list):
-                                if search_words_list[search_idx] == page_words_list[page_idx]:
-                                    if sequence_start_pos == -1:
-                                        sequence_start_pos = page_idx
-                                    found_sequence.append(search_words_list[search_idx])
-                                    sequence_end_pos = page_idx
-                                    search_idx += 1
-                                    page_idx += 1
-                                    words_skipped = 0
-                                else:
-                                    page_idx += 1
-                                    words_skipped += 1
-                                    
-                                    if words_skipped > MAX_WORDS_BETWEEN:
-                                        search_idx = 0
-                                        found_sequence = []
-                                        sequence_start_pos = -1
-                                        words_skipped = 0
-                            
-                            match_ratio = len(found_sequence) / len(search_words_list) if len(search_words_list) > 0 else 0
-                            
-                            if (match_ratio >= MIN_MATCH_RATIO and 
-                                len(found_sequence) >= MIN_WORDS_IN_SEQUENCE):
-                                text_found = True
-                                missing_words = [w for w in search_words_list if w not in found_sequence]
-                                
-                                logger.debug(f"Fuzzy match found via sequence (level 2): {found_sequence} "
-                                           f"(match ratio: {match_ratio:.2%}, {len(found_sequence)}/{len(search_words_list)} words in order)")
-                                
-                                if sequence_start_pos != -1 and found_sequence:
-                                    # Находим позицию по первому слову последовательности
-                                    first_word = found_sequence[0]
-                                    
-                                    # Ищем первое слово в оригинальном тексте
-                                    original_position = page_text.lower().find(first_word.lower())
-                                    
-                                    if original_position != -1:
-                                        match_length = len(' '.join(found_sequence)) * 2
-                                        
-                                        before, found, after = extract_context(page_text, original_position, match_length)
-                                        
-                                        context = {
-                                            'before': before,
-                                            'found': found,
-                                            'after': after,
-                                            'found_words': found_sequence,
-                                            'missing_words': missing_words if missing_words else None,
-                                            'match_ratio': f"{match_ratio:.0%}",
-                                            'cleaned_search': cleaned_search_text_no_digits
-                                        }
-                                        match_type = 'fuzzy'
-                                        
-                                        logger.debug(f"Found sequence (level 2) position in original text: {original_position}, first word: '{first_word}'")
+def _get_session():
+    """Возвращает requests.Session, локальную для текущего потока."""
+    s = getattr(_thread_local, 'session', None)
+    if s is None:
+        s = requests.Session()
+        _thread_local.session = s
+    return s
 
-        return text_found, None, match_type, context
-        
-    except requests.exceptions.Timeout:
-        return False, f"Timeout when accessing {url}", None, None
-    except requests.exceptions.ConnectionError:
-        return False, f"Connection error to {url}", None, None
-    except requests.exceptions.HTTPError as e:
-        return False, f"HTTP error {e.response.status_code} for {url}", None, None
-    except requests.exceptions.RequestException as e:
-        return False, f"Request error: {str(e)}", None, None
-    except Exception as e:
-        return False, f"Unexpected error: {str(e)}", None, None
 
-def process_excel_file(filename, delay=1, sheet_names=None, csv_output=None):
+def write_results_csv(records, csv_filename):
     """
-    Обрабатывает Excel файл и проверяет ссылки
+    Пишет полный отчёт по всем строкам-сообщениям (UTF-8 с BOM, защита от
+    CSV-инъекций). Заменяет прежний found-only CSV.
+    """
+    headers = ['Строка', 'Тип', 'Автор', 'URL', 'Текст',
+               'Статус', 'ТипСовпадения', 'НайденныйФрагмент']
+    try:
+        with open(csv_filename, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f, quoting=csv.QUOTE_ALL, escapechar='\\')
+            writer.writerow(headers)
+            for r in records:
+                writer.writerow([
+                    escape_csv_cell(r.get('row', '')),
+                    escape_csv_cell(r.get('type', '')),
+                    escape_csv_cell(r.get('author', '')),
+                    escape_csv_cell(r.get('url', '')),
+                    escape_csv_cell(r.get('text', '')),
+                    escape_csv_cell(r.get('status', '')),
+                    escape_csv_cell(r.get('match_type') or ''),
+                    escape_csv_cell(r.get('snippet') or ''),
+                ])
+        logger.info(f"Results CSV saved: {csv_filename}")
+        return True
+    except Exception as e:
+        logger.error(f"Error writing results CSV: {e}")
+        return False
+
+
+def _process_record(rec, timeout, retries, rate_limiter):
+    """Проверяет одну строку-сообщение; результат пишется в rec (in place)."""
+    status, error, match_type, snippet = check_text_on_page(
+        rec['url'], rec['text'], timeout=timeout, session=_get_session(),
+        retries=retries, rate_limiter=rate_limiter)
+    rec['status'] = status
+    rec['match_type'] = match_type
+    rec['error'] = error
+    if status == STATUS_ERROR:
+        rec['snippet'] = error or ''
+    else:
+        rec['snippet'] = snippet or ''
+    return rec
+
+
+def _run_pass(recs, n_workers, timeout, retries, rate_limiter, label):
+    """Прогоняет список записей через пул потоков; обновляет записи на месте."""
+    total = len(recs)
+    if total == 0:
+        return
+    done = 0
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        futures = [ex.submit(_process_record, r, timeout, retries, rate_limiter)
+                   for r in recs]
+        for _ in as_completed(futures):
+            done += 1
+            if done % 50 == 0 or done == total:
+                logger.info(f"[{label}] {done}/{total} processed")
+
+
+def _build_records(sheets_dict):
+    """
+    Из листов Excel собирает список строк-сообщений (непустые G и I, без
+    литеральной шапки 'Текст'/'Url'). Колонки Тип(K)/Автор(P) опциональны.
+    Excel-строка = позиция в df + 2 (read_excel header=0 съедает первую строку листа).
+    """
+    records = []
+    for sheet_name, df in sheets_dict.items():
+        ncols = df.shape[1]
+        if ncols < 9:
+            logger.error(f"Sheet '{sheet_name}': fewer than 9 columns - skipped")
+            continue
+        text_col = df.iloc[:, 6]
+        link_col = df.iloc[:, 8]
+        type_col = df.iloc[:, 10] if ncols > 10 else None
+        author_col = df.iloc[:, 15] if ncols > 15 else None
+
+        for pos in range(len(df)):
+            text = text_col.iloc[pos]
+            link = link_col.iloc[pos]
+            if pd.isna(text) or pd.isna(link):
+                continue
+            text = str(text).strip()
+            link = str(link).strip()
+            if not text or not link:
+                continue
+            if text.lower() == 'текст' and link.lower() == 'url':
+                continue  # литеральная шапка таблицы
+
+            rec = {
+                'row': pos + 2,
+                'sheet': sheet_name,
+                'text': text,
+                'url': link,
+                'type': '' if (type_col is None or pd.isna(type_col.iloc[pos]))
+                        else str(type_col.iloc[pos]).strip(),
+                'author': '' if (author_col is None or pd.isna(author_col.iloc[pos]))
+                          else str(author_col.iloc[pos]).strip(),
+                'status': None, 'match_type': None, 'snippet': None, 'error': None,
+            }
+            records.append(rec)
+    return records
+
+
+def process_excel_file(filename, sheet_names=None, csv_output=None, timeout=10,
+                       workers=8, retries=3, rate=6.0, limit=None, delay=0.0):
+    """
+    Обрабатывает Excel-файл: параллельно проверяет ссылки, пишет полный CSV-отчёт.
 
     Args:
-        filename: Путь к Excel файлу
-        delay: Задержка между запросами в секундах
-        sheet_names: Имена или индексы листов для обработки (None - все листы)
-        csv_output: Путь к CSV файлу для сохранения найденных совпадений (None - не сохранять)
+        filename: путь к Excel-файлу
+        sheet_names: листы (None — все; 0 — первый; список имён/индексов)
+        csv_output: путь к CSV (None — авто <input>_results_<timestamp>.csv)
+        timeout: таймаут HTTP-запроса
+        workers: число параллельных потоков
+        retries: доп. попыток при троттлинге/сбое
+        rate: целевая частота запросов (req/s) для глобального лимитера
+        limit: обработать только первые N строк-сообщений (валидация)
+        delay: верхняя граница джиттера между стартами запросов (сек)
     """
     logger.info(f"Starting processing file: {filename}")
-
     try:
-        # Чтение Excel файла
         logger.info("Reading Excel file...")
-
-        # Чтение листов
         if sheet_names is None:
-            # Читаем все листы
             sheets_dict = pd.read_excel(filename, sheet_name=None)
-            logger.info(f"Found sheets: {len(sheets_dict)}")
         else:
-            # Читаем указанные листы
             sheets_dict = pd.read_excel(filename, sheet_name=sheet_names)
-            if isinstance(sheets_dict, dict):
-                logger.info(f"Selected sheets: {len(sheets_dict)}")
-            else:
-                # Если указан один лист, pandas возвращает DataFrame, а не dict
-                sheets_dict = {sheet_names[0] if isinstance(sheet_names, list) else sheet_names: sheets_dict}
-                logger.info("Selected one sheet")
+            if not isinstance(sheets_dict, dict):
+                key = sheet_names[0] if isinstance(sheet_names, list) else sheet_names
+                sheets_dict = {key: sheets_dict}
+        logger.info(f"Sheets to scan: {len(sheets_dict)}")
 
-        total_rows_all = 0
-        found_count_all = 0
-        not_found_count_all = 0
-        error_count_all = 0
-        found_matches = []  # Список найденных совпадений для CSV
+        records = _build_records(sheets_dict)
+        if limit is not None:
+            records = records[:limit]
+        total = len(records)
+        logger.info(f"Message rows to process: {total}")
+        if total == 0:
+            logger.warning("No message rows found - nothing to do")
+            return
 
-        # Обработка каждого листа
-        for sheet_name, df in sheets_dict.items():
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Processing sheet: '{sheet_name}'")
-            logger.info(f"{'='*60}")
+        jitter = (0.0, delay if delay and delay > 0 else 0.3)
+        rate_limiter = RateLimiter(rate, jitter=jitter)
 
-            # Проверка наличия необходимых столбцов
-            if 'G' not in df.columns and len(df.columns) < 7:
-                logger.error(f"Sheet '{sheet_name}': Column G not found - skipped")
-                continue
+        # Основной проход
+        _run_pass(records, workers, timeout, retries, rate_limiter, 'pass1')
 
-            if 'I' not in df.columns and len(df.columns) < 9:
-                logger.error(f"Sheet '{sheet_name}': Column I not found - skipped")
-                continue
+        # Второй, медленный проход — ТОЛЬКО по транзиентным ошибкам (таймаут/429/
+        # соединение). Приватные /c/-каналы и стабы детерминированно непроверяемы —
+        # их повтор бессмыслен и лишь тратит время.
+        err_recs = [r for r in records
+                    if r['status'] == STATUS_ERROR and _is_transient_error(r.get('error'))]
+        if err_recs:
+            logger.info(f"Second slow pass over {len(err_recs)} transient {STATUS_ERROR} rows...")
+            slow_limiter = RateLimiter(1.0, jitter=(0.0, 0.3))
+            _run_pass(err_recs, min(2, workers), timeout, max(retries, 3),
+                      slow_limiter, 'pass2')
 
-            # Получение столбцов по индексу (G=6, I=8 в нулевой индексации)
-            text_column = df.iloc[:, 6]  # Столбец G
-            link_column = df.iloc[:, 8]  # Столбец I
+        # Стабильный порядок: по листу и Excel-строке
+        records.sort(key=lambda r: (str(r.get('sheet', '')), r['row']))
 
-            logger.info(f"Sheet '{sheet_name}': Found rows to process: {len(df)}")
+        if csv_output is None:
+            base = os.path.splitext(filename)[0]
+            csv_output = f"{base}_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        write_results_csv(records, csv_output)
 
-            total_rows = len(df)
-            found_count = 0
-            not_found_count = 0
-            error_count = 0
-
-            # Обработка каждой строки в листе
-            for idx, (text, link) in enumerate(zip(text_column, link_column), start=1):
-                logger.info(f"\nProcessing row {idx}/{total_rows} (sheet '{sheet_name}')")
-
-                # Проверка на пустые значения
-                if pd.isna(text) or pd.isna(link):
-                    logger.warning(f"Row {idx} (sheet '{sheet_name}'): Empty text or link - skipped")
-                    error_count += 1
-                    continue
-
-                text = str(text).strip()
-                link = str(link).strip()
-
-                logger.info(f"Text to search: {text[:100]}{'...' if len(text) > 100 else ''}")
-                
-                # Показываем очищенный текст для fuzzy поиска
-                cleaned = clean_text_for_search(text)
-                if cleaned != text:
-                    logger.info(f"Cleaned text for fuzzy search: {cleaned[:100]}{'...' if len(cleaned) > 100 else ''}")
-                
-                logger.info(f"Link: {link}")
-
-                # Проверка наличия текста на странице
-                found, error, match_type, context = check_text_on_page(link, text)
-
-                if error:
-                    logger.error(f"Row {idx} (sheet '{sheet_name}'): ERROR - {error}")
-                    error_count += 1
-                elif found:
-                    match_indicator = "✓" if match_type == 'exact' else "≈"
-                    match_desc = "exact match" if match_type == 'exact' else "fuzzy match"
-                    logger.info(f"Row {idx} (sheet '{sheet_name}'): {match_indicator} FOUND ({match_desc}) - Text present on page")
-                    
-                    # Логируем контекст найденного текста
-                    if context:
-                        logger.info(f"  Context:")
-                        if context.get('before'):
-                            logger.info(f"    Before: ...{context['before'][-200:]}")
-                        logger.info(f"    Found:  [{context.get('found', '')}]")
-                        if context.get('after'):
-                            logger.info(f"    After:  {context['after'][:200]}...")
-                        if 'cleaned_search' in context:
-                            logger.info(f"    Cleaned search text: {context['cleaned_search']}")
-                        if 'found_words' in context:
-                            logger.info(f"    Found words (in order): {', '.join(context['found_words'])}")
-                        if 'missing_words' in context and context['missing_words']:
-                            logger.info(f"    Missing words: {', '.join(context['missing_words'])}")
-                        if 'match_ratio' in context:
-                            logger.info(f"    Match ratio: {context['match_ratio']}")
-
-                    # Добавляем найденное совпадение в список для CSV
-                    found_matches.append((link, text))
-
-                    found_count += 1
-                else:
-                    logger.warning(f"Row {idx} (sheet '{sheet_name}'): ✗ NOT FOUND - Text absent from page")
-                    not_found_count += 1
-
-                # Задержка между запросами
-                if idx < total_rows:
-                    time.sleep(delay)
-
-            # Статистика по листу
-            logger.info(f"\n{'-'*60}")
-            logger.info(f"SHEET '{sheet_name}' STATISTICS:")
-            logger.info(f"Total rows processed: {total_rows}")
-            logger.info(f"Text found: {found_count}")
-            logger.info(f"Text not found: {not_found_count}")
-            logger.info(f"Processing errors: {error_count}")
-
-            # Накопление общей статистики
-            total_rows_all += total_rows
-            found_count_all += found_count
-            not_found_count_all += not_found_count
-            error_count_all += error_count
-
-        # Сохраняем найденные совпадения в CSV, если указан файл вывода
-        if csv_output and found_matches:
-            if save_found_matches_to_csv(found_matches, csv_output):
-                logger.info(f"Found {len(found_matches)} matches saved to CSV: {csv_output}")
-            else:
-                logger.error("Failed to save matches to CSV file")
-
-        # Итоговая статистика по всем листам
+        alive = sum(1 for r in records if r['status'] == STATUS_ALIVE)
+        deleted = sum(1 for r in records if r['status'] == STATUS_DELETED)
+        errors = sum(1 for r in records if r['status'] == STATUS_ERROR)
         logger.info(f"\n{'='*80}")
-        logger.info("FINAL STATISTICS FOR ALL SHEETS:")
-        logger.info(f"Total rows processed: {total_rows_all}")
-        logger.info(f"Text found: {found_count_all}")
-        logger.info(f"Text not found: {not_found_count_all}")
-        logger.info(f"Processing errors: {error_count_all}")
-        logger.info(f"Results saved to file: {log_filename}")
-        if csv_output and found_matches:
-            logger.info(f"Found matches saved to CSV: {csv_output}")
+        logger.info("FINAL STATISTICS:")
+        logger.info(f"Total message rows: {total}")
+        logger.info(f"{STATUS_ALIVE}: {alive}")
+        logger.info(f"{STATUS_DELETED}: {deleted}")
+        logger.info(f"{STATUS_ERROR}: {errors}")
+        logger.info(f"Results CSV: {csv_output}")
+        logger.info(f"Log file: {log_filename}")
+
+        print(f"\nВсего строк-сообщений: {total}")
+        print(f"  {STATUS_ALIVE}:    {alive}")
+        print(f"  {STATUS_DELETED}: {deleted}")
+        print(f"  {STATUS_ERROR}:  {errors}")
+        print(f"CSV-отчёт: {csv_output}")
 
     except FileNotFoundError:
         logger.error(f"File {filename} not found")
@@ -740,78 +788,51 @@ def process_excel_file(filename, delay=1, sheet_names=None, csv_output=None):
         logger.error(f"Critical error processing file: {str(e)}")
         raise
 
-def check_single_url(url, text, csv_output=None):
+
+def check_single_url(url, text, timeout=10, retries=3, csv_output=None):
     """
-    Проверяет наличие текста на одной веб-странице
+    Проверяет наличие текста на одной веб-странице.
 
     Args:
         url: URL для проверки
         text: Текст для поиска
-        csv_output: Путь к CSV файлу для сохранения результата
+        timeout: таймаут HTTP-запроса
+        retries: число доп. попыток при троттлинге/сбое
+        csv_output: Путь к CSV файлу для сохранения результата (опционально)
+
+    Returns:
+        bool: True, если статус ЖИВ.
     """
     logger.info("="*80)
     logger.info("Single URL check mode")
     logger.info(f"URL: {url}")
     logger.info(f"Text to search: {text[:100]}{'...' if len(text) > 100 else ''}")
-    
-    # Показываем очищенный текст для fuzzy поиска
-    cleaned = clean_text_for_search(text)
-    if cleaned != text.strip():
-        logger.info(f"Cleaned text for fuzzy search: {cleaned[:100]}{'...' if len(cleaned) > 100 else ''}")
-    
+    logger.info(f"Telegram host: {is_telegram_host(url)}")
     logger.info("="*80)
-    
-    # Проверка наличия текста на странице
-    found, error, match_type, context = check_text_on_page(url, text)
-    
-    if error:
-        logger.error(f"ERROR: {error}")
-        print(f"\n❌ ERROR: {error}")
-        return False
-    elif found:
-        match_indicator = "✓" if match_type == 'exact' else "≈"
-        match_desc = "exact match" if match_type == 'exact' else "fuzzy match"
-        logger.info(f"{match_indicator} FOUND ({match_desc}) - Text present on page")
-        print(f"\n✓ FOUND ({match_desc}) - Text present on page")
-        
-        # Логируем контекст найденного текста
-        if context:
-            logger.info(f"\nContext:")
-            if context.get('before'):
-                logger.info(f"  Before: ...{context['before'][-200:]}")
-            logger.info(f"  Found:  [{context.get('found', '')}]")
-            if context.get('after'):
-                logger.info(f"  After:  {context['after'][:200]}...")
-            if 'common_words' in context:
-                logger.info(f"  Common words: {', '.join(context['common_words'])}")
-            
-            # Выводим контекст в консоль
-            print(f"\nContext:")
-            if context.get('before'):
-                print(f"  Before: ...{context['before'][-200:]}")
-            print(f"  Found:  [{context.get('found', '')}]")
-            if context.get('after'):
-                print(f"  After:  {context['after'][:200]}...")
-            if 'cleaned_search' in context:
-                print(f"  Cleaned search text: {context['cleaned_search']}")
-            if 'found_words' in context:
-                print(f"  Found words (in order): {', '.join(context['found_words'])}")
-            if 'missing_words' in context and context['missing_words']:
-                print(f"  Missing words: {', '.join(context['missing_words'])}")
-            if 'match_ratio' in context:
-                print(f"  Match ratio: {context['match_ratio']}")
-        
-        # Сохраняем в CSV если указано
-        if csv_output:
-            if save_found_matches_to_csv([(url, text)], csv_output):
-                logger.info(f"Result saved to CSV: {csv_output}")
-                print(f"Result saved to CSV: {csv_output}")
-        
-        return True
+
+    status, error, match_type, snippet = check_text_on_page(
+        url, text, timeout=timeout, retries=retries)
+
+    logger.info(f"STATUS: {status} (match_type={match_type}, error={error})")
+    if snippet:
+        logger.info(f"Snippet: {snippet[:300]}")
+
+    if status == STATUS_ALIVE:
+        print(f"\n✓ {STATUS_ALIVE} ({match_type}) — текст найден на странице")
+        if snippet:
+            print(f"  Найдено: {snippet[:300]}")
+    elif status == STATUS_DELETED:
+        print(f"\n✗ {STATUS_DELETED} — текст отсутствует на странице")
     else:
-        logger.warning("✗ NOT FOUND - Text absent from page")
-        print("\n✗ NOT FOUND - Text absent from page")
-        return False
+        print(f"\n⚠ {STATUS_ERROR} — {error}")
+
+    if csv_output and status == STATUS_ALIVE:
+        record = {'row': '', 'type': '', 'author': '', 'url': url, 'text': text,
+                  'status': status, 'match_type': match_type, 'snippet': snippet}
+        if write_results_csv([record], csv_output):
+            print(f"Result saved to CSV: {csv_output}")
+
+    return status == STATUS_ALIVE
 
 def main():
     """Главная функция"""
@@ -857,8 +878,8 @@ Examples:
     parser.add_argument(
         '-d', '--delay',
         type=float,
-        default=1.0,
-        help='Delay between requests in seconds (default: 1.0)'
+        default=0.3,
+        help='Upper bound of random jitter between request starts, seconds (default: 0.3)'
     )
 
     parser.add_argument(
@@ -866,6 +887,34 @@ Examples:
         type=int,
         default=10,
         help='Timeout for HTTP requests in seconds (default: 10)'
+    )
+
+    parser.add_argument(
+        '--workers',
+        type=int,
+        default=8,
+        help='Number of parallel worker threads (default: 8)'
+    )
+
+    parser.add_argument(
+        '--retries',
+        type=int,
+        default=3,
+        help='Extra attempts on throttling/network errors (default: 3)'
+    )
+
+    parser.add_argument(
+        '--rate',
+        type=float,
+        default=6.0,
+        help='Global target request rate, req/s, for the shared limiter (default: 6.0)'
+    )
+
+    parser.add_argument(
+        '--limit',
+        type=int,
+        default=None,
+        help='Process only the first N message rows (for validation runs)'
     )
 
     parser.add_argument(
@@ -937,18 +986,15 @@ Examples:
         print("")
         
         # Проверяем одиночный URL
-        success = check_single_url(args.url, args.text, csv_output)
-        
+        success = check_single_url(args.url, args.text, timeout=args.timeout,
+                                   retries=args.retries, csv_output=csv_output)
+
         print(f"\nLog saved to: {log_filename}")
         sys.exit(0 if success else 1)
-    
+
     # Режим обработки Excel файла
-    # Автоматическая генерация имени CSV файла, если не указано
+    # csv_output=None → process_excel_file сам сгенерирует <input>_results_<timestamp>.csv
     csv_output = args.output_csv
-    if csv_output is None:
-        # Получаем имя файла без расширения и добавляем суффикс
-        base_name = os.path.splitext(args.excel_file)[0]
-        csv_output = f"{base_name}_found_matches.csv"
 
     # Определение листов для обработки
     sheet_names = 0  # По умолчанию первый лист (индекс 0)
@@ -980,14 +1026,18 @@ Examples:
     print(f"Sheets to process: {sheets_info}")
     print(f"Log directory: {os.path.dirname(log_filename)}")
     print(f"Log file: {os.path.basename(log_filename)}")
-    print(f"CSV output: {csv_output}")
-    print(f"Delay between requests: {args.delay} sec")
-    print(f"Request timeout: {args.timeout} sec")
+    print(f"CSV output: {csv_output if csv_output else '<input>_results_<timestamp>.csv (auto)'}")
+    print(f"Workers: {args.workers} | Rate: {args.rate} req/s | Retries: {args.retries} | Timeout: {args.timeout}s")
+    if args.limit:
+        print(f"Limit: first {args.limit} message rows (validation run)")
     print("="*80)
     print()
 
     # Запуск обработки
-    process_excel_file(args.excel_file, delay=args.delay, sheet_names=sheet_names, csv_output=csv_output)
+    process_excel_file(
+        args.excel_file, sheet_names=sheet_names, csv_output=csv_output,
+        timeout=args.timeout, workers=args.workers, retries=args.retries,
+        rate=args.rate, limit=args.limit, delay=args.delay)
 
     print()
     print("="*80)
