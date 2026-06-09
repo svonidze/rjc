@@ -61,3 +61,13 @@ create_*.py
 # Excel temp files
 ~$*.xlsx
 *.bak
+
+.input/
+
+# Generated data exports (csv/json/xlsx)
+*.csv
+*.json
+*.xlsx
+
+# OMC tooling state
+.omc/
