@@ -332,6 +332,78 @@ def match_message(search_text, message_fields, body_text, is_telegram):
     return (STATUS_ALIVE if found else STATUS_DELETED), match_type, snippet
 
 
+# ============================================================================
+# TELEGRAM: проверка по реально отображаемому контенту (embed-виджет)
+# ============================================================================
+# og:description — это закэшированное превью, которое СОХРАНЯЕТСЯ после удаления
+# поста, поэтому ему доверять нельзя (давало ложные ЖИВ). Истинный признак
+# «сообщение отображается сейчас» — текст в div.tgme_widget_message_text на
+# странице ?embed=1.
+
+def build_embed_url(url):
+    """Добавляет embed=1 к URL (сохраняя существующие query-параметры)."""
+    return url + ('&' if '?' in url else '?') + 'embed=1'
+
+
+def extract_telegram_widget_texts(soup):
+    """
+    Из embed-страницы Telegram достаёт реально отрендеренный контент.
+
+    Returns:
+        tuple: (widget_texts: [str], n_wrappers: int, is_private: bool)
+        n_wrappers — число div.tgme_widget_message (0 → ничего не отрендерено:
+        приватный канал/login/интерстишл).
+    """
+    widget_texts = [t.get_text(' ', strip=True)
+                    for t in soup.select('div.tgme_widget_message_text')]
+    widget_texts = [t for t in widget_texts if t]
+    n_wrappers = len(soup.select('div.tgme_widget_message'))
+    low = soup.get_text(' ', strip=True).lower()
+    is_private = ('private group or channel' in low) or ('only work if you are a member' in low)
+    return widget_texts, n_wrappers, is_private
+
+
+def match_telegram_widgets(search_text, widget_texts):
+    """
+    Совпадает ли искомый текст с одним из реально отображаемых виджетов.
+    Виджет содержит ПОЛНЫЙ текст сообщения, поэтому ищем вхождение G в виджет
+    (ng in nt) либо строгий префикс (на случай, если виджет короче).
+
+    Returns:
+        tuple: (found: bool, snippet: str|None)
+    """
+    ng = normalize(search_text)
+    if not ng:
+        return False, None
+    for t in widget_texts:
+        nt = normalize(t)
+        if not nt:
+            continue
+        if ng in nt or (len(nt) >= MIN_MATCH_CHARS and ng.startswith(nt)):
+            return True, t.strip()
+    return False, None
+
+
+def decide_telegram_status(search_text, widget_texts, n_wrappers, is_private):
+    """
+    Чистое решение статуса для Telegram по данным одной embed-страницы.
+
+    - ЖИВ      — G найден в одном из виджетов (реально отображается);
+    - ОШИБКА   — приватный канал/группа ИЛИ нет ни одной обёртки сообщения
+                 (login/интерстишл/нестандартная вёрстка) — проверить нельзя;
+    - УДАЛЁН   — обёртка есть, но текст G не отображается (удалён/скрыт/изменён).
+
+    Returns:
+        tuple: (status, match_type, snippet)
+    """
+    found, snippet = match_telegram_widgets(search_text, widget_texts)
+    if found:
+        return STATUS_ALIVE, 'tg_widget', snippet
+    if is_private or n_wrappers == 0:
+        return STATUS_ERROR, None, None
+    return STATUS_DELETED, None, None
+
+
 def escape_csv_cell(value):
     """
     Защита от CSV-инъекций в Excel: значения, начинающиеся с = + - @ TAB CR,
@@ -478,6 +550,94 @@ def _is_transient_error(error_msg):
     return any(marker in error_msg for marker in _TRANSIENT_MARKERS)
 
 
+def _fetch_embed(embed_url, timeout, getter, retries, rate_limiter):
+    """
+    Скачивает embed-страницу Telegram с сетевыми ретраями/троттлингом.
+
+    Returns:
+        tuple: (status_code|None, widget_texts, n_wrappers, is_private, error)
+        error != None → сетевой/транзиентный сбой (повторять имеет смысл).
+    """
+    last_error = None
+    for attempt in range(retries + 1):
+        if rate_limiter is not None:
+            rate_limiter.acquire()
+        try:
+            response = getter.get(embed_url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+            sc = response.status_code
+            if sc == 429 or sc >= 500:
+                if rate_limiter is not None:
+                    rate_limiter.report(True)
+                last_error = f"HTTP {sc} for {embed_url}"
+                if attempt < retries:
+                    _sleep_backoff(attempt)
+                    continue
+                return None, [], 0, False, last_error
+            response.raise_for_status()
+            if rate_limiter is not None:
+                rate_limiter.report(False)
+            if response.encoding is None:
+                response.encoding = response.apparent_encoding or 'utf-8'
+            soup = BeautifulSoup(response.text, 'html.parser')
+            texts, n_wrappers, is_private = extract_telegram_widget_texts(soup)
+            return sc, texts, n_wrappers, is_private, None
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if rate_limiter is not None:
+                rate_limiter.report(True)
+            last_error = f"{type(e).__name__} for {embed_url}"
+            if attempt < retries:
+                _sleep_backoff(attempt)
+                continue
+            return None, [], 0, False, last_error
+        except requests.exceptions.HTTPError as e:
+            sc = e.response.status_code if e.response is not None else '?'
+            return None, [], 0, False, f"HTTP error {sc} for {embed_url}"
+        except requests.exceptions.RequestException as e:
+            last_error = f"Request error: {e}"
+            if attempt < retries:
+                _sleep_backoff(attempt)
+                continue
+            return None, [], 0, False, last_error
+        except Exception as e:
+            return None, [], 0, False, f"Unexpected error: {e}"
+    return None, [], 0, False, last_error or "Unknown error"
+
+
+def _check_telegram(url, text_to_find, timeout, getter, retries, rate_limiter):
+    """
+    Проверка Telegram-ссылки по embed-виджету (реально отображаемый контент).
+    Для comment/thread-ссылок окно соседних комментов у Telegram слегка
+    недетерминировано → на «не совпало» делаем 1 повторный embed-запрос,
+    чтобы не потерять живой комментарий.
+    """
+    embed_url = build_embed_url(url)
+    is_comment = ('comment=' in url) or ('thread=' in url)
+    is_private = urlsplit(url).path.startswith('/c/')
+    attempts = 2 if is_comment else 1
+
+    widget_texts, n_wrappers = [], 0
+    for _ in range(attempts):
+        sc, widget_texts, n_wrappers, priv, error = _fetch_embed(
+            embed_url, timeout, getter, retries, rate_limiter)
+        if error:
+            return STATUS_ERROR, error, None, None
+        is_private = is_private or priv
+        status, match_type, snippet = decide_telegram_status(
+            text_to_find, widget_texts, n_wrappers, is_private)
+        if status == STATUS_ALIVE:
+            return STATUS_ALIVE, None, match_type, snippet
+
+    # После всех попыток совпадения нет
+    status, match_type, snippet = decide_telegram_status(
+        text_to_find, widget_texts, n_wrappers, is_private)
+    if status == STATUS_ERROR:
+        reason = ("Приватный канал/группа — проверить вручную (нужно членство)"
+                  if is_private else
+                  "Нет отображаемого сообщения (login/интерстишл/изменённая вёрстка)")
+        return STATUS_ERROR, reason, None, None
+    return status, None, match_type, snippet  # STATUS_DELETED
+
+
 def check_text_on_page(url, text_to_find, timeout=10, session=None, retries=0, rate_limiter=None):
     """
     Проверяет наличие текста на веб-странице (или в локальном файле).
@@ -527,6 +687,12 @@ def check_text_on_page(url, text_to_find, timeout=10, session=None, retries=0, r
 
     # ---- Веб-запрос с ретраями и адаптивным троттлингом ----
     getter = session if session is not None else requests
+
+    # Telegram: проверяем по реально отображаемому контенту (embed-виджет),
+    # а не по кэшируемому og:description.
+    if telegram:
+        return _check_telegram(url, text_to_find, timeout, getter, retries, rate_limiter)
+
     last_error = None
     for attempt in range(retries + 1):
         if rate_limiter is not None:
