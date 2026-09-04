@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Script to verify text presence from column G on web pages using links from column I
+Script to verify text presence from mixed Excel layouts on linked web pages
 """
 
 import pandas as pd
@@ -14,6 +14,7 @@ import re
 import csv
 import random
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.parse import urlparse, urlsplit
@@ -63,6 +64,17 @@ STATUS_ERROR = "ОШИБКА"
 # Хосты Telegram, для которых текст сообщения берётся из message-полей (og/виджет),
 # а не из soup.get_text() (там — заглушка «View in Telegram»).
 TELEGRAM_HOSTS = {"t.me", "telegram.me", "telegram.dog"}
+
+# Эти сайты отдают посты/комментарии динамически или через авторизацию. Простое
+# отсутствие искомого текста в статическом HTML не доказывает удаление записи.
+DYNAMIC_SOCIAL_HOSTS = {"vk.com", "ok.ru", "dzen.ru"}
+
+# Поддерживаемый стандартный экспорт и наблюдаемый вариант, где пустой столбец
+# «Заголовок» был физически удалён, сдвинув все следующие поля на один столбец.
+EXCEL_LAYOUTS = (
+    {"name": "G/I", "text": 6, "url": 8, "type": 10, "author": 12},
+    {"name": "F/H", "text": 5, "url": 7, "type": 9, "author": 11},
+)
 
 # ============================================================================
 # НАСТРОЙКИ HTTP ЗАПРОСОВ
@@ -204,6 +216,29 @@ def is_telegram_host(url):
     return host in TELEGRAM_HOSTS
 
 
+def normalized_host(url):
+    """Возвращает hostname без www, в нижнем регистре."""
+    try:
+        host = urlsplit(str(url)).hostname or ""
+    except (TypeError, ValueError):
+        return ""
+    host = host.lower()
+    return host.removeprefix('www.')
+
+
+def is_dynamic_social_host(url):
+    """True для сайтов, где статический HTML не авторитетен при несовпадении."""
+    return normalized_host(url) in DYNAMIC_SOCIAL_HOSTS
+
+
+def _same_site_host(first, second):
+    """Считает основной домен и его поддомены одним сайтом."""
+    if not first or not second:
+        return False
+    return (first == second or first.endswith('.' + second)
+            or second.endswith('.' + first))
+
+
 def extract_page_message(soup):
     """
     Извлекает высокосигнальные «поля сообщения» страницы.
@@ -330,6 +365,38 @@ def match_message(search_text, message_fields, body_text, is_telegram):
 
     found, match_type, snippet = _match_body_legacy(search_text, body_text)
     return (STATUS_ALIVE if found else STATUS_DELETED), match_type, snippet
+
+
+def decide_nontelegram_web_status(url, final_url, search_text, fields):
+    """
+    Определяет статус обычной веб-страницы после успешного HTTP-ответа.
+
+    Для VK/OK/Dzen положительное совпадение остаётся достоверным, но простое
+    несовпадение в статическом HTML становится ОШИБКОЙ, а не ложным УДАЛЁН.
+    Остальные сайты сохраняют прежнее exact/fuzzy-поведение.
+
+    Returns:
+        tuple: (status, error, match_type, snippet)
+    """
+    status, match_type, snippet = match_message(
+        search_text, fields['message_fields'], fields['body_text'], False)
+    if status == STATUS_ALIVE:
+        return status, None, match_type, snippet
+
+    if is_dynamic_social_host(url):
+        source_host = normalized_host(url)
+        destination_host = normalized_host(final_url)
+        if destination_host and not _same_site_host(source_host, destination_host):
+            reason = (f"{source_host}: перенаправление на {destination_host}; "
+                      "возможно, требуется вход")
+        else:
+            reason = (f"{source_host}: текст не найден в статическом HTML; "
+                      "динамический контент нельзя надёжно проверить без браузера")
+        return STATUS_ERROR, reason, None, None
+
+    if status == STATUS_ERROR:
+        return STATUS_ERROR, "Пустой текст для поиска", None, None
+    return status, None, match_type, snippet
 
 
 # ============================================================================
@@ -642,9 +709,9 @@ def check_text_on_page(url, text_to_find, timeout=10, session=None, retries=0, r
     """
     Проверяет наличие текста на веб-странице (или в локальном файле).
 
-    Для Telegram текст ищется в message-полях (og:description/виджет), т.к. в
-    soup.get_text() лежит лишь заглушка «View in Telegram». Для остальных хостов —
-    legacy-поиск по видимому тексту.
+    Для Telegram текст ищется в embed-виджете. Для VK/OK/Dzen совпадение в
+    статическом HTML считается достоверным, а несовпадение — непроверяемой
+    ошибкой. Для остальных хостов сохраняется legacy-поиск по видимому тексту.
 
     Args:
         url: URL страницы или путь к локальному файлу
@@ -715,20 +782,8 @@ def check_text_on_page(url, text_to_find, timeout=10, session=None, retries=0, r
                 response.encoding = response.apparent_encoding or 'utf-8'
             soup = BeautifulSoup(response.text, 'html.parser')
             fields = extract_page_message(soup)
-            status, match_type, snippet = match_message(
-                text_to_find, fields['message_fields'], fields['body_text'], telegram)
-            err = None
-            if status == STATUS_ERROR:
-                body_low = fields['body_text'].lower()
-                is_private = (
-                    urlsplit(url).path.startswith('/c/')
-                    or 'private group or channel' in body_low
-                    or 'only work if you are a member' in body_low
-                )
-                err = ("Приватный канал/группа — проверить вручную (нужно членство)"
-                       if is_private
-                       else "Нет текста сообщения на странице (заглушка/login/изменённая вёрстка)")
-            return status, err, match_type, snippet
+            return decide_nontelegram_web_status(
+                url, response.url, text_to_find, fields)
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             if rate_limiter is not None:
                 rate_limiter.report(True)
@@ -824,47 +879,84 @@ def _run_pass(recs, n_workers, timeout, retries, rate_limiter, label):
                 logger.info(f"[{label}] {done}/{total} processed")
 
 
+def _cell_text(df, row, column):
+    """Возвращает строковое значение ячейки DataFrame или пустую строку."""
+    if column >= df.shape[1]:
+        return ''
+    value = df.iat[row, column]
+    return '' if pd.isna(value) else str(value).strip()
+
+
 def _build_records(sheets_dict):
     """
-    Из листов Excel собирает список строк-сообщений (непустые G и I, без
-    литеральной шапки 'Текст'/'Url'). Колонки Тип(K)/Автор(P) опциональны.
+    Из листов Excel собирает строки-сообщения в двух вариантах экспорта:
+    G/I + Тип(K)/Автор(M) и сдвинутый F/H + Тип(J)/Автор(L).
+    Вариант определяется для каждой строки по непустому тексту и HTTP(S)-URL.
     Excel-строка = позиция в df + 2 (read_excel header=0 съедает первую строку листа).
     """
     records = []
+    layout_counts = Counter()
     for sheet_name, df in sheets_dict.items():
         ncols = df.shape[1]
-        if ncols < 9:
-            logger.error(f"Sheet '{sheet_name}': fewer than 9 columns - skipped")
+        if ncols < 8:
+            logger.error(f"Sheet '{sheet_name}': fewer than 8 columns - skipped")
             continue
-        text_col = df.iloc[:, 6]
-        link_col = df.iloc[:, 8]
-        type_col = df.iloc[:, 10] if ncols > 10 else None
-        author_col = df.iloc[:, 15] if ncols > 15 else None
 
         for pos in range(len(df)):
-            text = text_col.iloc[pos]
-            link = link_col.iloc[pos]
-            if pd.isna(text) or pd.isna(link):
+            candidates = []
+            valid_candidates = []
+            is_header_row = False
+            for layout in EXCEL_LAYOUTS:
+                if layout['url'] >= ncols:
+                    continue
+                text = _cell_text(df, pos, layout['text'])
+                link = _cell_text(df, pos, layout['url'])
+                if not text or not link:
+                    continue
+                if text.lower() == 'текст' and link.lower() in ('url', 'ссылка'):
+                    is_header_row = True
+                    continue
+                candidate = (layout, text, link)
+                candidates.append(candidate)
+                try:
+                    parsed = urlparse(link)
+                    is_http = parsed.scheme.lower() in ('http', 'https') and bool(parsed.netloc)
+                except ValueError:
+                    is_http = False
+                if is_http:
+                    valid_candidates.append(candidate)
+
+            if is_header_row:
                 continue
-            text = str(text).strip()
-            link = str(link).strip()
-            if not text or not link:
+            if valid_candidates:
+                layout, text, link = valid_candidates[0]
+                if len(valid_candidates) > 1:
+                    logger.warning(
+                        f"Sheet '{sheet_name}', row {pos + 2}: both F/H and G/I "
+                        "contain valid records; using standard G/I")
+            elif candidates:
+                # Сохраняем прежнее поведение для повреждённых строк: они попадут
+                # в полный CSV как ОШИБКА «Invalid URL», а не исчезнут из отчёта.
+                layout, text, link = candidates[0]
+            else:
                 continue
-            if text.lower() == 'текст' and link.lower() == 'url':
-                continue  # литеральная шапка таблицы
 
             rec = {
                 'row': pos + 2,
                 'sheet': sheet_name,
                 'text': text,
                 'url': link,
-                'type': '' if (type_col is None or pd.isna(type_col.iloc[pos]))
-                        else str(type_col.iloc[pos]).strip(),
-                'author': '' if (author_col is None or pd.isna(author_col.iloc[pos]))
-                          else str(author_col.iloc[pos]).strip(),
+                'type': _cell_text(df, pos, layout['type']),
+                'author': _cell_text(df, pos, layout['author']),
+                'layout': layout['name'],
                 'status': None, 'match_type': None, 'snippet': None, 'error': None,
             }
             records.append(rec)
+            layout_counts[layout['name']] += 1
+
+    if layout_counts:
+        logger.info("Detected Excel layouts: " + ', '.join(
+            f"{name}={layout_counts.get(name, 0)}" for name in ('F/H', 'G/I')))
     return records
 
 
@@ -1213,4 +1305,3 @@ Examples:
 
 if __name__ == "__main__":
     main()
-
