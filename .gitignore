@@ -53,6 +53,9 @@ test_*.xlsx
 test_*.html
 create_*.py
 
+# Постоянные регрессионные тесты анализатора
+!jew_analyzer/tests/test_*.py
+
 # Temporary files
 *.tmp
 *.temp
